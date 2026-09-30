@@ -7,10 +7,10 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 # Importa a função da página de login do arquivo login.py
-from login import login_page
+from frontend.login import login_page
 
 # URL base da API do Xano
-XANO_API_URL = "https://x8ki-letl-twmt.n7.xano.io/api:Nq0yy-QT"
+XANO_API_URL = "https://x8ki-letl-twmt.n7.xano.io/api:VzEWcgd6"
 
 
 class State(rx.State):
