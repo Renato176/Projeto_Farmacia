@@ -6,15 +6,18 @@ from pathlib import Path
 # Adiciona a pasta raiz do frontend ao caminho do Python
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-# Importa a função da página de login do arquivo login.py
+# Importa todas as páginas do sistema
 from frontend.login import login_page
+from frontend.register import register_page
+from frontend.forgot_password import forgot_password_page
+from frontend.reset_password import reset_password_page
 
 # URL base da API do Xano
 XANO_API_URL = "https://x8ki-letl-twmt.n7.xano.io/api:VzEWcgd6"
 
 
 class State(rx.State):
-    """Estado da aplicação para gerenciar dados e interações."""
+    """Estado da aplicação para gerenciar dados e interações do painel de vendas."""
     produtos: list[dict] = []
     carrinho: list[dict] = []
     cliente_id: str = ""
@@ -100,11 +103,20 @@ def index() -> rx.Component:
     )
 
 
-# Inicialização da aplicação com as duas páginas registradas:
+# Inicialização da aplicação com todas as rotas registadas:
 app = rx.App()
 
-# 1. Tela de Login como Página Inicial
+# 1. Tela de Login como Página Inicial (/)
 app.add_page(login_page, route="/") 
 
-# 2. Tela de Vendas (Dashboard) na rota /dashboard
+# 2. Tela de Cadastro (/register)
+app.add_page(register_page, route="/register")
+
+# 3. Tela de Recuperação de Senha (/recuperar-senha)
+app.add_page(forgot_password_page, route="/recuperar-senha")
+
+# 4. Tela de Redefinição de Senha (/redefinir-senha)
+app.add_page(reset_password_page, route="/redefinir-senha")
+
+# 5. Tela de Vendas / Dashboard (/dashboard)
 app.add_page(index, route="/dashboard")

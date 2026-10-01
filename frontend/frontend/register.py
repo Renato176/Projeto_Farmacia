@@ -13,31 +13,31 @@ COLOR_ACCENT = "#22d3ee"
 COLOR_ACCENT_2 = "#3b82f6"
 
 
-class LoginState(rx.State):
+class RegisterState(rx.State):
+    name: str = ""
     email: str = ""
     password: str = ""
     show_password: bool = False
-    remember_me: bool = True
     error_message: str = ""
     is_loading: bool = False
 
     def toggle_show_password(self):
         self.show_password = not self.show_password
 
+    def set_name(self, value: str):
+        self.name = value
+
     def set_email(self, value: str):
         self.email = value
 
     def set_password(self, value: str):
         self.password = value
-        
-    def set_remember_me(self, value: bool):
-        self.remember_me = value
 
-    async def handle_login(self):
+    async def handle_register(self):
         self.is_loading = True
         self.error_message = ""
 
-        if not self.email or not self.password:
+        if not self.name or not self.email or not self.password:
             self.error_message = "Por favor, preencha todos os campos."
             self.is_loading = False
             return
@@ -47,21 +47,21 @@ class LoginState(rx.State):
                 response = await client.post(
                     f"{XANO_API_URL}/auth/login",
                     json={
+                        "name": self.name,
                         "email": self.email,
                         "password": self.password
                     },
                     timeout=10.0
                 )
 
-                if response.status_code == 200:
-                    return rx.redirect("/dashboard")
-                elif response.status_code == 401:
-                    self.error_message = "E-mail ou senha incorretos."
+                if response.status_code in [200, 201]:
+                    return rx.redirect("/")
                 else:
-                    self.error_message = "Erro ao conectar com o servidor. Tente novamente."
+                    data = response.json()
+                    self.error_message = data.get("message", "Erro ao criar conta. Tente novamente.")
 
         except httpx.RequestError:
-            self.error_message = "Não foi possível alcançar o servidor de autenticação."
+            self.error_message = "Não foi possível conectar ao servidor."
         except Exception as e:
             print(f"Erro inesperado: {e}")
             self.error_message = "Ocorreu um erro interno."
@@ -69,71 +69,43 @@ class LoginState(rx.State):
             self.is_loading = False
 
 
-def logo() -> rx.Component:
-    return rx.box(
-        rx.icon("plus", size=30, color="white", stroke_width=2.5),
-        position="relative",
-        display="flex",
-        align_items="center",
-        justify_content="center",
-        width="72px",
-        height="72px",
-        border="2px solid",
-        border_color=COLOR_ACCENT,
-        border_radius="20px",
-        background="rgba(34, 211, 238, 0.08)",
-        margin_bottom="1em",
-    )
-
-
-def header() -> rx.Component:
-    return rx.vstack(
-        logo(),
-        rx.hstack(
-            rx.text("Farmácia", color=COLOR_TEXT_PRIMARY, font_size="1.6em", font_weight="700"),
-            rx.text("Saúde+", color=COLOR_ACCENT, font_size="1.6em", font_weight="700"),
-            spacing="2",
-        ),
-        rx.text(
-            "Mais saúde para o seu dia a dia",
-            color=COLOR_TEXT_SECONDARY,
-            font_size="0.9em",
-        ),
-        align_items="center",
-        spacing="1",
-        margin_bottom="2em",
-    )
-
-
-def login_form() -> rx.Component:
+def register_form() -> rx.Component:
     return rx.vstack(
         rx.vstack(
-            rx.text(
-                "Acesse sua conta",
-                color=COLOR_TEXT_PRIMARY,
-                font_size="1.2em",
-                font_weight="700",
-            ),
-            rx.text(
-                "Bem-vindo de volta! Entre com seu e-mail para continuar.",
-                color=COLOR_TEXT_SECONDARY,
-                font_size="0.85em",
-                text_align="left",
-            ),
+            rx.text("Criar Nova Conta", color=COLOR_TEXT_PRIMARY, font_size="1.2em", font_weight="700"),
+            rx.text("Preencha os dados abaixo para começar.", color=COLOR_TEXT_SECONDARY, font_size="0.85em"),
             align_items="start",
             spacing="1",
             width="100%",
             margin_bottom="1.5em",
         ),
         rx.cond(
-            LoginState.error_message != "",
-            rx.text(LoginState.error_message, color="#ef4444", font_size="0.85em", margin_bottom="0.5em")
+            RegisterState.error_message != "",
+            rx.text(RegisterState.error_message, color="#ef4444", font_size="0.85em", margin_bottom="0.5em")
         ),
         rx.hstack(
             rx.icon("user", size=18, color=COLOR_TEXT_SECONDARY),
             rx.input(
+                placeholder="Nome completo",
+                on_change=RegisterState.set_name,
+                width="100%",
+                border="none",
+                background="transparent",
+            ),
+            width="100%",
+            padding="0.5em 1em",
+            background=COLOR_INPUT_BG,
+            border="1px solid",
+            border_color=COLOR_BORDER,
+            border_radius="12px",
+            spacing="3",
+            align_items="center",
+        ),
+        rx.hstack(
+            rx.icon("mail", size=18, color=COLOR_TEXT_SECONDARY),
+            rx.input(
                 placeholder="exemplo@email.com",
-                on_change=LoginState.set_email,
+                on_change=RegisterState.set_email,
                 width="100%",
                 border="none",
                 background="transparent",
@@ -151,18 +123,18 @@ def login_form() -> rx.Component:
             rx.icon("lock", size=18, color=COLOR_TEXT_SECONDARY),
             rx.input(
                 placeholder="••••••••",
-                on_change=LoginState.set_password,
-                type=rx.cond(LoginState.show_password, "text", "password"),
+                on_change=RegisterState.set_password,
+                type=rx.cond(RegisterState.show_password, "text", "password"),
                 width="100%",
                 border="none",
                 background="transparent",
             ),
             rx.icon(
-                tag=rx.cond(LoginState.show_password, "eye-off", "eye"),
+                tag=rx.cond(RegisterState.show_password, "eye-off", "eye"),
                 size=18,
                 color=COLOR_TEXT_SECONDARY,
                 cursor="pointer",
-                on_click=LoginState.toggle_show_password,
+                on_click=RegisterState.toggle_show_password,
                 _hover={"color": COLOR_ACCENT},
             ),
             width="100%",
@@ -174,35 +146,10 @@ def login_form() -> rx.Component:
             spacing="3",
             align_items="center",
         ),
-        
-        rx.hstack(
-            rx.hstack(
-                rx.checkbox(
-                    checked=LoginState.remember_me,
-                    on_change=LoginState.set_remember_me,
-                    color_scheme="cyan",
-                ),
-                rx.text("Lembrar de mim", color=COLOR_TEXT_SECONDARY, font_size="0.85em"),
-                spacing="2",
-                align_items="center",
-            ),
-            rx.spacer(),
-            rx.link(
-                "Esqueci minha senha?",
-                href="/recuperar-senha",
-                color=COLOR_ACCENT,
-                font_size="0.85em",
-                _hover={"color": COLOR_ACCENT_2, "text_decoration": "underline"},
-            ),
-            width="100%",
-            margin_top="0.5em",
-            margin_bottom="1.5em",
-        ),
-
         rx.button(
-            "Entrar",
-            on_click=LoginState.handle_login,
-            loading=LoginState.is_loading,
+            "Cadastrar",
+            on_click=RegisterState.handle_register,
+            loading=RegisterState.is_loading,
             width="100%",
             padding="1.2em 0",
             border_radius="12px",
@@ -210,14 +157,7 @@ def login_form() -> rx.Component:
             color="white",
             cursor="pointer",
         ),
-        rx.link(
-            "Não tem uma conta? Cadastre-se",
-            href="/register",
-            color=COLOR_ACCENT,
-            font_size="0.85em",
-            margin_top="0.5em",
-            text_align="center",
-        ),
+        rx.link("Já tem uma conta? Faça login", href="/", color=COLOR_ACCENT, font_size="0.85em", text_align="center"),
         width="100%",
         spacing="4",
         padding="2em",
@@ -229,12 +169,11 @@ def login_form() -> rx.Component:
     )
 
 
-def login_page() -> rx.Component:
+def register_page() -> rx.Component:
     return rx.box(
         rx.center(
             rx.vstack(
-                header(),
-                login_form(),
+                register_form(),
                 width="100%",
                 max_width="380px",
                 align_items="center",
