@@ -24,6 +24,11 @@ class ForgotPasswordState(rx.State):
     def set_email(self, value: str):
         self.email = value
 
+    def limpar_mensagem(self):
+        self.message = ""
+        self.is_success = False
+        self.is_loading = False
+
     async def handle_recover(self):
         self.is_loading = True
         self.message = ""
@@ -35,27 +40,32 @@ class ForgotPasswordState(rx.State):
             return
 
         try:
+            payload = {"email": self.email}
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{XANO_API_URL}/authqpassword-reset",
-                    json={"email": self.email},
-                    timeout=10.0
+                    f"{XANO_API_URL}/esqueci-senha",
+                    json=payload,
+                    timeout=10.0,
                 )
 
                 if response.status_code in [200, 201]:
                     data = response.json()
                     self.is_success = True
                     self.message = data.get("message", "Instruções enviadas com sucesso.")
-                    
-                    # Aguarda um breve momento para o utilizador ver a mensagem e redireciona para a tela de redefinição
                     return rx.redirect("/redefinir-senha")
-                else:
-                    data = response.json()
-                    self.message = data.get("message", "Não foi possível processar o pedido.")
+
+                data = response.json()
+                self.message = data.get("message", "Não foi possível processar o pedido.")
         except httpx.RequestError:
-            self.message = "Erro de conexão com o servidor."
+            self.message = (
+                "Não foi possível solicitar a recuperação de senha. "
+                "Verifique sua conexão e tente novamente."
+            )
         except Exception:
-            self.message = "Ocorreu um erro interno."
+            self.message = (
+                "Ocorreu um erro ao solicitar a recuperação de senha. "
+                "Tente novamente."
+            )
         finally:
             self.is_loading = False
 

@@ -16,6 +16,7 @@ COLOR_ACCENT_2 = "#3b82f6"
 class LoginState(rx.State):
     email: str = ""
     password: str = ""
+    _auth_token: str = ""
     show_password: bool = False
     remember_me: bool = True
     error_message: str = ""
@@ -33,6 +34,10 @@ class LoginState(rx.State):
     def set_remember_me(self, value: bool):
         self.remember_me = value
 
+    def limpar_mensagem(self):
+        self.error_message = ""
+        self.is_loading = False
+
     async def handle_login(self):
         self.is_loading = True
         self.error_message = ""
@@ -43,23 +48,46 @@ class LoginState(rx.State):
             return
 
         try:
+            payload = {
+                "email": self.email,
+                "password": self.password,
+            }
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{XANO_API_URL}/auth/login",
-                    json={
-                        "email": self.email,
-                        "password": self.password
-                    },
-                    timeout=10.0
+                    f"{XANO_API_URL}/auth/acesso",
+                    json=payload,
+                    timeout=10.0,
                 )
 
                 if response.status_code == 200:
+                    try:
+                        token = response.json()
+                    except ValueError:
+                        token = response.text.strip().strip('"')
+
+                    if not isinstance(token, str) or not token.strip():
+                        self.error_message = "O servidor não retornou um token de acesso válido."
+                        return
+
+                    self._auth_token = token.strip()
                     return rx.redirect("/dashboard")
+
+                try:
+                    response_data = response.json()
+                except ValueError:
+                    response_data = {}
+
+                api_message = (
+                    response_data.get("message")
+                    if isinstance(response_data, dict)
+                    else None
+                )
+                if isinstance(api_message, str) and api_message.strip():
+                    self.error_message = api_message
                 elif response.status_code == 401:
                     self.error_message = "E-mail ou senha incorretos."
                 else:
                     self.error_message = "Erro ao conectar com o servidor. Tente novamente."
-
         except httpx.RequestError:
             self.error_message = "Não foi possível alcançar o servidor de autenticação."
         except Exception as e:

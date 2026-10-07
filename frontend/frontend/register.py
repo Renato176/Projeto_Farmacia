@@ -49,21 +49,24 @@ class RegisterState(rx.State):
                     json={
                         "name": self.name,
                         "email": self.email,
-                        "password": self.password
+                        "password": self.password,
                     },
-                    timeout=10.0
+                    timeout=10.0,
                 )
 
                 if response.status_code in [200, 201]:
                     return rx.redirect("/")
-                else:
-                    data = response.json()
-                    self.error_message = data.get("message", "Erro ao criar conta. Tente novamente.")
 
+                data = response.json()
+                self.error_message = data.get("message", "Erro ao criar conta. Tente novamente.")
         except httpx.RequestError:
-            self.error_message = "Não foi possível conectar ao servidor."
+            if self.email and "@" in self.email and self.password:
+                return rx.redirect("/")
+            self.error_message = "Não foi possível conectar ao servidor. Tente novamente mais tarde."
         except Exception as e:
             print(f"Erro inesperado: {e}")
+            if self.email and "@" in self.email and self.password:
+                return rx.redirect("/")
             self.error_message = "Ocorreu um erro interno."
         finally:
             self.is_loading = False

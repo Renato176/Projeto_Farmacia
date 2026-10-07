@@ -7,10 +7,10 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 # Importa todas as páginas do sistema
-from frontend.login import login_page
+from frontend.login import LoginState, login_page
 from frontend.register import register_page
-from frontend.forgot_password import forgot_password_page
-from frontend.reset_password import reset_password_page
+from frontend.forgot_password import ForgotPasswordState, forgot_password_page
+from frontend.reset_password import ResetPasswordState, reset_password_page
 
 # URL base da API do Xano
 XANO_API_URL = "https://x8ki-letl-twmt.n7.xano.io/api:VzEWcgd6"
@@ -107,16 +107,28 @@ def index() -> rx.Component:
 app = rx.App()
 
 # 1. Tela de Login como Página Inicial (/)
-app.add_page(login_page, route="/") 
+app.add_page(
+    login_page,
+    route="/",
+    on_load=LoginState.limpar_mensagem,
+)
 
 # 2. Tela de Cadastro (/register)
 app.add_page(register_page, route="/register")
 
 # 3. Tela de Recuperação de Senha (/recuperar-senha)
-app.add_page(forgot_password_page, route="/recuperar-senha")
+app.add_page(
+    forgot_password_page,
+    route="/recuperar-senha",
+    on_load=ForgotPasswordState.limpar_mensagem,
+)
 
 # 4. Tela de Redefinição de Senha (/redefinir-senha)
-app.add_page(reset_password_page, route="/redefinir-senha")
+app.add_page(
+    reset_password_page,
+    route="/redefinir-senha",
+    on_load=ResetPasswordState.limpar_mensagem,
+)
 
 # 5. Tela de Vendas / Dashboard (/dashboard)
 app.add_page(index, route="/dashboard")

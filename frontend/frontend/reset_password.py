@@ -18,6 +18,7 @@ COLOR_ACCENT_2 = "#3b82f6"
 class ResetPasswordState(rx.State):
     password: str = ""
     confirm_password: str = ""
+    show_password: bool = False
     message: str = ""
     is_success: bool = False
     is_loading: bool = False
@@ -27,6 +28,14 @@ class ResetPasswordState(rx.State):
 
     def set_confirm_password(self, value: str):
         self.confirm_password = value
+
+    def toggle_show_password(self):
+        self.show_password = not self.show_password
+
+    def limpar_mensagem(self):
+        self.message = ""
+        self.is_success = False
+        self.is_loading = False
 
     async def handle_reset(self):
         self.is_loading = True
@@ -39,28 +48,31 @@ class ResetPasswordState(rx.State):
             return
 
         if self.password != self.confirm_password:
-            self.message = "As palavras-passe não coincidem."
+            self.message = "As senhas não coincidem."
             self.is_loading = False
             return
 
         try:
+            payload = {"password": self.password}
             async with httpx.AsyncClient() as client:
-                # Altere a rota caso o endpoint no Xano para definir a nova senha tenha outro nome (ex: /auth/reset-password)
                 response = await client.post(
-                    f"{XANO_API_URL}/auth/reset-password",
-                    json={"password": self.password},
-                    timeout=10.0
+                    f"{XANO_API_URL}/authqpassword-reset",
+                    json=payload,
+                    timeout=10.0,
                 )
 
                 if response.status_code in [200, 201]:
                     data = response.json()
                     self.is_success = True
-                    self.message = data.get("message", "Palavra-passe alterada com sucesso!")
+                    self.message = data.get("message", "Senha alterada com sucesso!")
                 else:
                     data = response.json()
-                    self.message = data.get("message", "Não foi possível alterar a palavra-passe.")
+                    self.message = data.get("message", "Não foi possível alterar a senha.")
         except httpx.RequestError:
-            self.message = "Erro de conexão com o servidor."
+            self.message = (
+                "Não foi possível conectar ao servidor para redefinir a senha. "
+                "Tente novamente."
+            )
         except Exception:
             self.message = "Ocorreu um erro interno."
         finally:
@@ -90,12 +102,21 @@ def reset_password_form() -> rx.Component:
         rx.hstack(
             rx.icon("lock", size=18, color=COLOR_TEXT_SECONDARY),
             rx.input(
-                placeholder="Nova palavra-passe",
-                type="password",
+                placeholder="Nova senha",
+                type=rx.cond(ResetPasswordState.show_password, "text", "password"),
+                value=ResetPasswordState.password,
                 on_change=ResetPasswordState.set_password,
                 width="100%",
                 border="none",
                 background="transparent",
+            ),
+            rx.icon(
+                tag=rx.cond(ResetPasswordState.show_password, "eye-off", "eye"),
+                size=18,
+                color=COLOR_TEXT_SECONDARY,
+                cursor="pointer",
+                on_click=ResetPasswordState.toggle_show_password,
+                _hover={"color": COLOR_ACCENT},
             ),
             width="100%",
             padding="0.5em 1em",
@@ -110,8 +131,9 @@ def reset_password_form() -> rx.Component:
         rx.hstack(
             rx.icon("lock", size=18, color=COLOR_TEXT_SECONDARY),
             rx.input(
-                placeholder="Confirme a nova palavra-passe",
-                type="password",
+                placeholder="Confirme a nova senha",
+                type=rx.cond(ResetPasswordState.show_password, "text", "password"),
+                value=ResetPasswordState.confirm_password,
                 on_change=ResetPasswordState.set_confirm_password,
                 width="100%",
                 border="none",
