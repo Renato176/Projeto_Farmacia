@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import reflex as rx
@@ -17,6 +18,7 @@ COLOR_TEXT_PRIMARY = "#f5f7fa"
 COLOR_TEXT_SECONDARY = "#9aa3b2"
 COLOR_ACCENT = "#22d3ee"
 COLOR_ACCENT_2 = "#3b82f6"
+CUSTOMER_DISCOUNT_RATE = 14
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +41,14 @@ class LoginState(rx.State):
     sales: list[dict[str, Any]] = []
     cart: list[dict[str, Any]] = []
     product_search: str = ""
-    low_stock_only: bool = False
     product_name: str = ""
     product_barcode: str = ""
     product_price: str = ""
     product_stock: str = ""
+    product_image_url: str = ""
+    product_image_preview_url: str = ""
+    original_product_image_url: str = ""
+    show_product_form: bool = False
     editing_product_id: int = 0
     stock_error: str = ""
     stock_notice: str = ""
@@ -51,8 +56,17 @@ class LoginState(rx.State):
     is_saving_product: bool = False
     sales_error: str = ""
     is_loading_sales: bool = False
-    payment_method: str = "pix"
+    show_cart_panel: bool = False
     selected_customer: str = ""
+    customer_status: str = "unregistered"
+    payment_method: str = "pix"
+    show_customer_form: bool = False
+    is_saving_customer: bool = False
+    customer_form_error: str = ""
+    customer_notice: str = ""
+    customer_name: str = ""
+    customer_cpf: str = ""
+    customer_phone: str = ""
 
     @rx.event
     def toggle_show_password(self):
@@ -209,28 +223,49 @@ class LoginState(rx.State):
         self.customers = []
         self.sales = []
         self.cart = []
+        self.selected_customer = ""
+        self.customer_status = "unregistered"
+        self.show_cart_panel = False
+        self.customer_name = ""
+        self.customer_cpf = ""
+        self.customer_phone = ""
+        self.customer_notice = ""
+        self.customer_form_error = ""
+        self.show_customer_form = False
         return rx.redirect("/")
 
     @rx.var
     def filtered_products(self) -> list[dict[str, Any]]:
         query = self.product_search.strip().casefold()
-        return [
-            product
-            for product in self.products
-            if (
+        filtered = []
+        for product in self.products:
+            if not (
                 not query
                 or query in str(product.get("nome", "")).casefold()
                 or query in str(product.get("codigo_barras", "")).casefold()
+            ):
+                continue
+            product_id = int(product.get("id", 0))
+            cart_item = next(
+                (
+                    item
+                    for item in self.cart
+                    if int(item["produto_id"]) == product_id
+                ),
+                None,
             )
-            and (
-                not self.low_stock_only
-                or self._stock_quantity(product) <= 5
+            filtered.append(
+                {
+                    **product,
+                    "cart_status": (
+                        f"No carrinho: {int(cart_item['quantidade'])}"
+                        if cart_item
+                        else "Ainda não selecionado"
+                    ),
+                    "cart_status_color": "#2563eb" if cart_item else "#64748b",
+                }
             )
-        ]
-
-    @rx.var
-    def low_stock_count(self) -> int:
-        return sum(self._stock_quantity(product) <= 5 for product in self.products)
+        return filtered
 
     @rx.var
     def cart_total(self) -> float:
@@ -244,12 +279,68 @@ class LoginState(rx.State):
         return sum(int(item["quantidade"]) for item in self.cart)
 
     @rx.var
-    def customer_names(self) -> list[str]:
+    def customer_options(self) -> list[str]:
         return [
-            str(customer.get("nome", ""))
+            f"{customer.get('nome', '')} · CPF {customer.get('cpf', '')}"
             for customer in self.customers
-            if customer.get("nome")
+            if (
+                customer.get("nome")
+                and customer.get("cpf")
+                and customer.get("esta_registrado") is True
+            )
         ]
+
+    @rx.var
+    def selected_customer_is_registered(self) -> bool:
+        return self._is_selected_customer_registered()
+
+    def _is_selected_customer_registered(self) -> bool:
+        return (
+            self.customer_status == "registered"
+            and bool(self.selected_customer)
+            and any(
+                f"{customer.get('nome', '')} · CPF {customer.get('cpf', '')}"
+                == self.selected_customer
+                and bool(customer.get("esta_registrado"))
+                for customer in self.customers
+            )
+        )
+
+    @rx.var
+    def cart_discount(self) -> float:
+        subtotal = sum(
+            float(item["preco"]) * int(item["quantidade"])
+            for item in self.cart
+        )
+        return (
+            round(subtotal * CUSTOMER_DISCOUNT_RATE / 100, 2)
+            if self._is_selected_customer_registered()
+            else 0.0
+        )
+
+    @rx.var
+    def cart_final_total(self) -> float:
+        subtotal = sum(
+            float(item["preco"]) * int(item["quantidade"])
+            for item in self.cart
+        )
+        return round(subtotal - self.cart_discount, 2)
+
+    @staticmethod
+    def _format_currency(value: float) -> str:
+        return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    @rx.var
+    def cart_total_formatted(self) -> str:
+        return self._format_currency(self.cart_total)
+
+    @rx.var
+    def cart_discount_formatted(self) -> str:
+        return self._format_currency(self.cart_discount)
+
+    @rx.var
+    def cart_final_total_formatted(self) -> str:
+        return self._format_currency(self.cart_final_total)
 
     @staticmethod
     def _stock_quantity(product: dict[str, Any]) -> int:
@@ -272,15 +363,36 @@ class LoginState(rx.State):
             )
             return False
         try:
-            self.products = xano.response_records(
-                xano.response_data(response),
-                "produtos",
+            self.products = self._normalize_products(
+                xano.response_data(response)
             )
         except ValueError:
             logger.error("O endpoint /produto retornou dados fora do formato esperado.")
             self.stock_error = "O Xano retornou uma lista de produtos inválida."
             return False
         return True
+
+    @staticmethod
+    def _normalize_products(data: Any) -> list[dict[str, Any]]:
+        products = xano.response_records(data, "produtos")
+        normalized_products = []
+        for product in products:
+            try:
+                formatted_price = f"{float(product.get('preco', 0)):.2f}".replace(
+                    ".",
+                    ",",
+                )
+            except (TypeError, ValueError):
+                formatted_price = str(product.get("preco", ""))
+
+            normalized_products.append(
+                {
+                    **product,
+                    "imagem_url": str(product.get("imagem_url") or ""),
+                    "preco_formatado": formatted_price,
+                }
+            )
+        return normalized_products
 
     @rx.event
     async def load_stock(self):
@@ -302,10 +414,6 @@ class LoginState(rx.State):
         self.product_search = value
 
     @rx.event
-    def toggle_low_stock_filter(self):
-        self.low_stock_only = not self.low_stock_only
-
-    @rx.event
     def set_product_name(self, value: str):
         self.product_name = value
 
@@ -322,6 +430,36 @@ class LoginState(rx.State):
         self.product_stock = value
 
     @rx.event
+    def set_product_image_url(self, value: str):
+        self.product_image_url = value
+        parsed_image_url = urlparse(value.strip())
+        self.product_image_preview_url = (
+            value.strip()
+            if parsed_image_url.scheme in ("http", "https")
+            and parsed_image_url.netloc
+            else ""
+        )
+        self.stock_error = ""
+
+    @rx.event
+    def start_new_product(self):
+        self.cancel_product_edit()
+        self.show_product_form = True
+
+    @rx.event
+    def set_product_form_open(self, is_open: bool):
+        self.show_product_form = is_open
+        if not is_open:
+            self.editing_product_id = 0
+            self.product_name = ""
+            self.product_barcode = ""
+            self.product_price = ""
+            self.product_stock = ""
+            self.product_image_url = ""
+            self.product_image_preview_url = ""
+            self.original_product_image_url = ""
+
+    @rx.event
     def start_product_edit(
         self,
         product_id: int,
@@ -329,12 +467,23 @@ class LoginState(rx.State):
         barcode: str,
         price: float,
         stock: int,
+        image_url: str,
     ):
         self.editing_product_id = product_id
         self.product_name = name
         self.product_barcode = barcode
         self.product_price = str(price)
         self.product_stock = str(stock)
+        self.product_image_url = image_url
+        parsed_image_url = urlparse(image_url.strip())
+        self.product_image_preview_url = (
+            image_url.strip()
+            if parsed_image_url.scheme in ("http", "https")
+            and parsed_image_url.netloc
+            else ""
+        )
+        self.original_product_image_url = image_url
+        self.show_product_form = True
         self.stock_notice = ""
         self.stock_error = ""
 
@@ -345,6 +494,10 @@ class LoginState(rx.State):
         self.product_barcode = ""
         self.product_price = ""
         self.product_stock = ""
+        self.product_image_url = ""
+        self.product_image_preview_url = ""
+        self.original_product_image_url = ""
+        self.show_product_form = False
         self.stock_notice = ""
 
     @rx.event
@@ -357,6 +510,15 @@ class LoginState(rx.State):
         if not name or not barcode:
             self.stock_error = "Informe o nome e o código de barras do produto."
             return
+        image_url = self.product_image_url.strip()
+        if image_url:
+            parsed_image_url = urlparse(image_url)
+            if (
+                parsed_image_url.scheme not in ("http", "https")
+                or not parsed_image_url.netloc
+            ):
+                self.stock_error = "Informe uma URL válida começando com http:// ou https://."
+                return
 
         try:
             price = float(self.product_price.replace(",", "."))
@@ -374,6 +536,10 @@ class LoginState(rx.State):
             "preco": price,
             "estoque_quantidade": stock,
         }
+        if image_url or self.original_product_image_url:
+            payload["imagem_url"] = image_url
+        product_id = self.editing_product_id
+        image_changed = image_url != self.original_product_image_url
         endpoint = (
             f"/produto/{self.editing_product_id}"
             if self.editing_product_id
@@ -397,41 +563,42 @@ class LoginState(rx.State):
                     xano.response_data(response),
                     f"Não foi possível salvar o produto (HTTP {response.status_code}).",
                 )
+                if image_url:
+                    self.stock_error += (
+                        " Confirme se o campo imagem_url foi configurado no Xano."
+                    )
+                return
+            if not await self._load_products():
+                return
+
+            saved_product = next(
+                (
+                    product
+                    for product in self.products
+                    if (
+                        int(product.get("id", 0)) == product_id
+                        if product_id
+                        else product.get("codigo_barras") == barcode
+                    )
+                ),
+                None,
+            )
+            if image_changed and (
+                saved_product is None
+                or saved_product.get("imagem_url", "") != image_url
+            ):
+                self.stock_error = (
+                    "O produto foi salvo, mas a foto não foi persistida. "
+                    "Confirme o campo imagem_url e os endpoints do Xano."
+                )
                 return
             self.cancel_product_edit()
             self.stock_notice = "Produto salvo com sucesso."
-            await self._load_products()
         except httpx.RequestError:
             logger.warning("A gravação de produto no Xano falhou.")
             self.stock_error = "Não foi possível conectar ao Xano para salvar."
         finally:
             self.is_saving_product = False
-
-    @rx.event
-    async def delete_product(self, product_id: int):
-        if not self._auth_token:
-            return rx.redirect("/")
-
-        self.stock_error = ""
-        self.stock_notice = ""
-        try:
-            response = await xano.request(
-                "DELETE",
-                f"/produto/{product_id}",
-                auth_token=self._auth_token,
-                base_url=xano.XANO_PHARMACY_API_URL,
-            )
-            if response.status_code not in (200, 204):
-                self.stock_error = xano.response_message(
-                    xano.response_data(response),
-                    f"Não foi possível excluir o produto (HTTP {response.status_code}).",
-                )
-                return
-            self.stock_notice = "Produto excluído."
-            await self._load_products()
-        except httpx.RequestError:
-            logger.warning("A exclusão de produto no Xano falhou.")
-            self.stock_error = "Não foi possível conectar ao Xano para excluir."
 
     @rx.event
     async def load_sales(self):
@@ -484,9 +651,8 @@ class LoginState(rx.State):
                 xano.response_data(sales_response),
                 "vendas",
             )
-            self.products = xano.response_records(
-                xano.response_data(products_response),
-                "produtos",
+            self.products = self._normalize_products(
+                xano.response_data(products_response)
             )
             self.customers = xano.response_records(
                 xano.response_data(customers_response),
@@ -534,6 +700,9 @@ class LoginState(rx.State):
                 "produto_id": product_id,
                 "nome": str(product.get("nome", "")),
                 "preco": float(product.get("preco", 0)),
+                "preco_formatado": self._format_currency(
+                    float(product.get("preco", 0))
+                ),
                 "quantidade": 1,
                 "estoque_quantidade": stock,
             }
@@ -559,7 +728,22 @@ class LoginState(rx.State):
     @rx.event
     def clear_cart(self):
         self.cart = []
+        self.selected_customer = ""
+        self.customer_status = "unregistered"
+        self.show_cart_panel = False
+        self.customer_notice = ""
         self.sales_error = ""
+
+    @rx.event
+    def set_cart_panel_open(self, value: bool):
+        self.show_cart_panel = value
+
+    @rx.event
+    def set_customer_status(self, value: str):
+        self.customer_status = value
+        if value == "unregistered":
+            self.selected_customer = ""
+            self.customer_notice = ""
 
     @rx.event
     def set_payment_method(self, value: str):
@@ -568,6 +752,123 @@ class LoginState(rx.State):
     @rx.event
     def set_selected_customer(self, value: str):
         self.selected_customer = value
+        self.customer_status = "registered" if value else "unregistered"
+        self.customer_notice = ""
+
+    @rx.event
+    def open_customer_form(self):
+        self.customer_name = ""
+        self.customer_cpf = ""
+        self.customer_phone = ""
+        self.customer_form_error = ""
+        self.customer_status = "registered"
+        self.show_customer_form = True
+
+    @rx.event
+    def set_customer_form_open(self, value: bool):
+        self.show_customer_form = value
+
+    @rx.event
+    def set_customer_name(self, value: str):
+        self.customer_name = value
+
+    @rx.event
+    def set_customer_cpf(self, value: str):
+        self.customer_cpf = value
+
+    @rx.event
+    def set_customer_phone(self, value: str):
+        self.customer_phone = value
+
+    @staticmethod
+    def _cpf_digits(value: str) -> str:
+        return "".join(character for character in value if character.isdigit())
+
+    @rx.event
+    async def save_customer(self):
+        name = self.customer_name.strip()
+        cpf = self._cpf_digits(self.customer_cpf)
+        phone = self.customer_phone.strip()
+        if not name or len(cpf) != 11 or not phone:
+            self.customer_form_error = (
+                "Informe o nome, um CPF com 11 dígitos e o telefone."
+            )
+            return
+
+        if any(
+            self._cpf_digits(str(customer.get("cpf", ""))) == cpf
+            for customer in self.customers
+        ):
+            self.customer_form_error = "Já existe um cliente cadastrado com este CPF."
+            return
+
+        self.is_saving_customer = True
+        self.customer_form_error = ""
+        try:
+            response = await xano.request(
+                "POST",
+                "/cliente",
+                auth_token=self._auth_token,
+                base_url=xano.XANO_PHARMACY_API_URL,
+                payload={
+                    "nome": name,
+                    "cpf": cpf,
+                    "telefone": phone,
+                    "esta_registrado": True,
+                },
+            )
+            response_data = xano.response_data(response)
+            if response.status_code not in (200, 201):
+                self.customer_form_error = xano.response_message(
+                    response_data,
+                    f"Não foi possível cadastrar o cliente (HTTP {response.status_code}).",
+                )
+                return
+
+            customers_response = await xano.request(
+                "GET",
+                "/cliente",
+                auth_token=self._auth_token,
+                base_url=xano.XANO_PHARMACY_API_URL,
+            )
+            if customers_response.status_code != 200:
+                self.customer_form_error = (
+                    "Cliente cadastrado, mas não foi possível atualizar a lista. "
+                    "Tente atualizar a tela."
+                )
+                logger.error(
+                    "O cliente foi criado, mas a lista /cliente não pôde ser atualizada."
+                )
+                return
+
+            try:
+                self.customers = xano.response_records(
+                    xano.response_data(customers_response),
+                    "clientes",
+                )
+            except ValueError:
+                logger.error(
+                    "O endpoint /cliente retornou uma lista inválida após o cadastro."
+                )
+                self.customer_form_error = (
+                    "Cliente cadastrado, mas o Xano retornou uma lista inválida."
+                )
+                return
+
+            self.selected_customer = f"{name} · CPF {cpf}"
+            self.customer_status = "registered"
+            self.customer_notice = (
+                "Cliente cadastrado e selecionado; desconto de "
+                f"{CUSTOMER_DISCOUNT_RATE}% aplicado ao carrinho."
+            )
+            self.show_customer_form = False
+        except httpx.RequestError:
+            logger.warning("O cadastro de cliente no Xano falhou.")
+            self.customer_form_error = (
+                "Não foi possível conectar ao Xano para cadastrar o cliente."
+            )
+        finally:
+            self.is_saving_customer = False
 
 
 class SplashState(rx.State):
@@ -1468,9 +1769,73 @@ def management_page_shell(
 
 
 def stock_page() -> rx.Component:
+    def product_input(
+        label: str,
+        placeholder: str,
+        value: rx.Var,
+        on_change: Any,
+        input_type: str = "text",
+    ) -> rx.Component:
+        return rx.vstack(
+            rx.text(
+                label,
+                color="#34485b",
+                font_size="0.9rem",
+                font_weight="600",
+            ),
+            rx.input(
+                placeholder=placeholder,
+                value=value,
+                on_change=on_change,
+                type=input_type,
+                aria_label=label,
+                width="100%",
+                height="48px",
+                padding="0 0.9rem",
+                background="#f8fafc",
+                border="1px solid #cbd5e1",
+                border_radius="10px",
+                color="#1f2c39",
+                _placeholder={"color": "#94a3b8"},
+                _focus={
+                    "border": "1px solid #16a34a",
+                    "box_shadow": "0 0 0 3px rgba(22,163,74,0.12)",
+                    "outline": "none",
+                },
+            ),
+            width="100%",
+            spacing="2",
+            align_items="stretch",
+        )
+
     def product_row(product: rx.Var) -> rx.Component:
         quantity = product["estoque_quantidade"].to(int)
         return rx.hstack(
+            rx.box(
+                rx.cond(
+                    product["imagem_url"] != "",
+                    rx.image(
+                        src=product["imagem_url"],
+                        alt=product["nome"],
+                        width="56px",
+                        height="56px",
+                        object_fit="cover",
+                        border_radius="10px",
+                    ),
+                    rx.box(
+                        rx.icon("image", size=22, color="#94a3b8"),
+                        width="56px",
+                        height="56px",
+                        background="#f1f5f9",
+                        border_radius="10px",
+                        display="flex",
+                        align_items="center",
+                        justify_content="center",
+                    ),
+                ),
+                width="12%",
+                flex_shrink="0",
+            ),
             rx.vstack(
                 rx.text(
                     product["nome"],
@@ -1485,14 +1850,8 @@ def stock_page() -> rx.Component:
                 ),
                 align_items="flex-start",
                 spacing="1",
-                width="32%",
-            ),
-            rx.text(
-                "R$ ",
-                product["preco"],
-                color="#34485b",
-                font_weight="600",
-                width="20%",
+                width="38%",
+                flex_shrink="0",
             ),
             rx.vstack(
                 rx.text(
@@ -1507,86 +1866,103 @@ def stock_page() -> rx.Component:
                 ),
                 align_items="flex-start",
                 spacing="1",
-                width="20%",
+                width="16%",
+                flex_shrink="0",
             ),
-            rx.button(
-                "Editar",
-                on_click=LoginState.start_product_edit(
-                    product["id"],
-                    product["nome"],
-                    product["codigo_barras"],
-                    product["preco"],
-                    quantity,
+            rx.text(
+                "R$ ",
+                product["preco_formatado"],
+                color="#34485b",
+                font_weight="600",
+                width="16%",
+                flex_shrink="0",
+            ),
+            rx.box(
+                rx.button(
+                    "Editar",
+                    on_click=LoginState.start_product_edit(
+                        product["id"],
+                        product["nome"],
+                        product["codigo_barras"],
+                        product["preco"],
+                        quantity,
+                        product["imagem_url"],
+                    ),
+                    variant="outline",
+                    color="#1d4ed8",
+                    size="2",
                 ),
-                variant="outline",
-                color="#1d4ed8",
-                size="2",
-            ),
-            rx.button(
-                "Excluir",
-                on_click=LoginState.delete_product(product["id"]),
-                variant="outline",
-                color="#dc2626",
-                size="2",
+                width="18%",
+                flex_shrink="0",
             ),
             width="100%",
             padding="0.9rem 1rem",
             border_bottom="1px solid #e5e7eb",
             align_items="center",
-            spacing="3",
-            flex_wrap="wrap",
+            spacing="0",
+            min_width="700px",
         )
 
     content = rx.vstack(
-        rx.hstack(
-            rx.vstack(
-                rx.text("Produtos cadastrados", color="#64748b", font_size="0.9rem"),
-                rx.text(LoginState.products.length(), color="#1f2c39", font_size="1.6rem", font_weight="700"),
-                padding="1rem 1.25rem",
-                background="white",
-                border="1px solid #e5e7eb",
-                border_radius="14px",
-                width="100%",
+        rx.vstack(
+            rx.text(
+                "Pesquisar produtos",
+                color="#34485b",
+                font_size="0.9rem",
+                font_weight="700",
             ),
-            rx.vstack(
-                rx.text("Estoque baixo (até 5)", color="#64748b", font_size="0.9rem"),
-                rx.text(LoginState.low_stock_count, color="#dc2626", font_size="1.6rem", font_weight="700"),
-                padding="1rem 1.25rem",
-                background="white",
-                border="1px solid #e5e7eb",
-                border_radius="14px",
+            rx.hstack(
+                rx.icon("search", size=19, color="#475569"),
+                rx.input(
+                    placeholder="Nome ou código de barras",
+                    value=LoginState.product_search,
+                    on_change=LoginState.set_product_search,
+                    aria_label="Pesquisar produtos por nome ou código de barras",
+                    width="100%",
+                    height="48px",
+                    padding="0 0.2rem",
+                    color="#1f2c39",
+                    border="none",
+                    outline="none",
+                    background="transparent",
+                    _placeholder={"color": "#64748b", "opacity": "1"},
+                    _focus={"box_shadow": "none"},
+                ),
                 width="100%",
+                min_height="54px",
+                padding="0 0.9rem",
+                background="#ffffff",
+                border="1px solid #94a3b8",
+                border_radius="12px",
+                box_shadow="0 2px 6px rgba(15,23,42,0.06)",
+                spacing="3",
+                align_items="center",
+                _focus_within={
+                    "border": "1px solid #16a34a",
+                    "box_shadow": "0 0 0 3px rgba(22,163,74,0.14)",
+                },
             ),
             width="100%",
-            spacing="3",
+            max_width="620px",
+            spacing="2",
+            align_items="stretch",
         ),
         rx.hstack(
-            rx.input(
-                placeholder="Buscar por nome ou código de barras",
-                value=LoginState.product_search,
-                on_change=LoginState.set_product_search,
-                width="100%",
-                max_width="520px",
-                background="white",
-            ),
-            rx.button(
-                rx.cond(LoginState.low_stock_only, "Mostrar todos", "Estoque baixo"),
-                on_click=LoginState.toggle_low_stock_filter,
-                variant="outline",
-            ),
             rx.spacer(),
             rx.button(
-                "Novo produto",
-                on_click=LoginState.cancel_product_edit,
+                rx.icon("plus", size=17),
+                "Incluir produto",
+                on_click=LoginState.start_new_product,
                 background="#16a34a",
                 color="white",
+                border_radius="10px",
+                padding="0.8rem 1rem",
             ),
             width="100%",
-            align_items="center",
-            flex_wrap="wrap",
         ),
         rx.cond(
-            LoginState.stock_error != "",
+            (LoginState.stock_error != "")
+            & (LoginState.show_product_form == False),
             rx.text(LoginState.stock_error, color="#dc2626", role="alert"),
             rx.fragment(),
         ),
@@ -1595,110 +1971,219 @@ def stock_page() -> rx.Component:
             rx.text(LoginState.stock_notice, color="#16a34a", role="status"),
             rx.fragment(),
         ),
-        rx.vstack(
-            rx.heading(
-                rx.cond(
-                    LoginState.editing_product_id > 0,
-                    "Editar produto",
-                    "Cadastrar produto",
-                ),
-                color="#1f2c39",
-                size="4",
-            ),
-            rx.hstack(
-                rx.input(
-                    placeholder="Nome do produto",
-                    value=LoginState.product_name,
-                    on_change=LoginState.set_product_name,
-                    width="100%",
-                    background="white",
-                ),
-                rx.input(
-                    placeholder="Código de barras",
-                    value=LoginState.product_barcode,
-                    on_change=LoginState.set_product_barcode,
-                    width="100%",
-                    background="white",
-                ),
-                width="100%",
-                flex_wrap="wrap",
-            ),
-            rx.hstack(
-                rx.input(
-                    placeholder="Preço (ex.: 12,50)",
-                    value=LoginState.product_price,
-                    on_change=LoginState.set_product_price,
-                    type="number",
-                    width="100%",
-                    background="white",
-                ),
-                rx.input(
-                    placeholder="Quantidade em estoque",
-                    value=LoginState.product_stock,
-                    on_change=LoginState.set_product_stock,
-                    type="number",
-                    width="100%",
-                    background="white",
-                ),
-                rx.button(
-                    rx.cond(
-                        LoginState.is_saving_product,
-                        "Salvando...",
-                        "Salvar produto",
+        rx.dialog.root(
+            rx.dialog.content(
+                rx.hstack(
+                    rx.vstack(
+                        rx.dialog.title(
+                            rx.cond(
+                                LoginState.editing_product_id > 0,
+                                "Editar produto",
+                                "Incluir produto",
+                            ),
+                            color="#1f2c39",
+                            font_size="1.35rem",
+                            font_weight="700",
+                        ),
+                        rx.dialog.description(
+                            "Preencha os dados abaixo para manter seu estoque atualizado.",
+                            color="#64748b",
+                            font_size="0.9rem",
+                        ),
+                        align_items="flex-start",
+                        spacing="1",
                     ),
-                    on_click=LoginState.save_product,
-                    loading=LoginState.is_saving_product,
-                    background="#16a34a",
-                    color="white",
+                    rx.dialog.close(
+                        rx.button(
+                            rx.icon("x", size=18),
+                            variant="ghost",
+                            color="#64748b",
+                            aria_label="Fechar formulário",
+                        )
+                    ),
+                    width="100%",
+                    justify="between",
+                    align_items="flex-start",
+                    margin_bottom="0.5rem",
                 ),
-                rx.button(
-                    "Cancelar",
-                    on_click=LoginState.cancel_product_edit,
-                    variant="outline",
+                rx.cond(
+                    LoginState.stock_error != "",
+                    rx.text(
+                        LoginState.stock_error,
+                        color="#b91c1c",
+                        background="#fef2f2",
+                        padding="0.75rem 0.9rem",
+                        border="1px solid #fecaca",
+                        border_radius="10px",
+                        font_size="0.88rem",
+                        role="alert",
+                        width="100%",
+                    ),
+                    rx.fragment(),
                 ),
-                width="100%",
-                flex_wrap="wrap",
+                rx.hstack(
+                    product_input(
+                        "Nome do produto",
+                        "Ex.: Paracetamol 750 mg",
+                        LoginState.product_name,
+                        LoginState.set_product_name,
+                    ),
+                    product_input(
+                        "Código de barras",
+                        "Digite o código de barras",
+                        LoginState.product_barcode,
+                        LoginState.set_product_barcode,
+                    ),
+                    width="100%",
+                    spacing="4",
+                    flex_wrap="wrap",
+                ),
+                rx.hstack(
+                    product_input(
+                        "Preço (R$)",
+                        "Ex.: 12,50",
+                        LoginState.product_price,
+                        LoginState.set_product_price,
+                        "number",
+                    ),
+                    product_input(
+                        "Quantidade em estoque",
+                        "Ex.: 25",
+                        LoginState.product_stock,
+                        LoginState.set_product_stock,
+                        "number",
+                    ),
+                    width="100%",
+                    spacing="4",
+                    flex_wrap="wrap",
+                ),
+                product_input(
+                    "Foto do produto (opcional)",
+                    "Cole aqui a URL da imagem",
+                    LoginState.product_image_url,
+                    LoginState.set_product_image_url,
+                    "url",
+                ),
+                rx.cond(
+                    LoginState.product_image_preview_url != "",
+                    rx.vstack(
+                        rx.text(
+                            "Pré-visualização da foto",
+                            color="#34485b",
+                            font_size="0.85rem",
+                            font_weight="600",
+                        ),
+                        rx.image(
+                            src=LoginState.product_image_preview_url,
+                            alt="Pré-visualização da foto do produto",
+                            width="128px",
+                            height="128px",
+                            object_fit="contain",
+                            background="#f8fafc",
+                            border="1px solid #e2e8f0",
+                            border_radius="12px",
+                            padding="0.4rem",
+                        ),
+                        width="100%",
+                        spacing="2",
+                        align_items="flex-start",
+                    ),
+                    rx.fragment(),
+                ),
+                rx.text(
+                    "A foto aparece aqui pela URL informada. Para mantê-la após salvar, o Xano precisa aceitar e armazenar imagem_url.",
+                    color="#64748b",
+                    font_size="0.8rem",
+                    margin_top="-0.5rem",
+                ),
+                rx.hstack(
+                    rx.dialog.close(
+                        rx.button(
+                            "Cancelar",
+                            variant="outline",
+                            color="#475569",
+                            border_color="#cbd5e1",
+                            height="44px",
+                            padding="0 1.2rem",
+                        )
+                    ),
+                    rx.button(
+                        rx.cond(
+                            LoginState.is_saving_product,
+                            "Salvando...",
+                            "Salvar produto",
+                        ),
+                        on_click=LoginState.save_product,
+                        loading=LoginState.is_saving_product,
+                        background="#16a34a",
+                        color="white",
+                        height="44px",
+                        padding="0 1.3rem",
+                        border_radius="10px",
+                        _hover={"background": "#15803d"},
+                    ),
+                    width="100%",
+                    justify="end",
+                    spacing="3",
+                    margin_top="0.5rem",
+                ),
+                width="min(92vw, 620px)",
+                max_height="90vh",
+                overflow_y="auto",
+                padding="1.6rem",
+                background="white",
+                border="1px solid #e2e8f0",
+                border_radius="18px",
+                box_shadow="0 24px 80px rgba(15,23,42,0.24)",
+                spacing="4",
             ),
-            width="100%",
-            padding="1.25rem",
-            background="white",
-            border="1px solid #e5e7eb",
-            border_radius="16px",
-            spacing="3",
-            align_items="stretch",
+            open=LoginState.show_product_form,
+            on_open_change=LoginState.set_product_form_open,
         ),
         rx.vstack(
             rx.hstack(
-                rx.text("Produto", width="32%", font_weight="700", color="#475569"),
-                rx.text("Preço", width="20%", font_weight="700", color="#475569"),
-                rx.text("Quantidade", width="20%", font_weight="700", color="#475569"),
-                rx.text("Ações", font_weight="700", color="#475569"),
+                rx.text("Foto", width="12%", font_weight="700", color="#475569"),
+                rx.text("Produto", width="38%", font_weight="700", color="#475569"),
+                rx.text("Quantidade", width="16%", font_weight="700", color="#475569"),
+                rx.text("Preço", width="16%", font_weight="700", color="#475569"),
+                rx.text("Ação", width="18%", font_weight="700", color="#475569"),
                 width="100%",
+                min_width="700px",
                 padding="0.9rem 1rem",
                 border_bottom="1px solid #e5e7eb",
-                flex_wrap="wrap",
+                align_items="center",
+                spacing="0",
             ),
             rx.cond(
                 LoginState.is_loading_products,
-                rx.text("Carregando produtos do Xano...", color="#64748b", padding="1rem"),
+                rx.text(
+                    "Carregando produtos do Xano...",
+                    color="#64748b",
+                    padding="1rem",
+                ),
                 rx.fragment(),
             ),
             rx.foreach(LoginState.filtered_products, product_row),
             rx.cond(
-                (LoginState.products.length() == 0)
+                (LoginState.filtered_products.length() == 0)
                 & (LoginState.is_loading_products == False),
                 rx.text(
-                    "Ainda não há produtos cadastrados no Xano.",
+                    rx.cond(
+                        LoginState.products.length() == 0,
+                        "Ainda não há produtos cadastrados no Xano.",
+                        "Nenhum produto encontrado para essa busca.",
+                    ),
                     color="#64748b",
                     padding="1rem",
                 ),
                 rx.fragment(),
             ),
             width="100%",
+            min_width="700px",
             background="white",
             border="1px solid #e5e7eb",
             border_radius="16px",
-            overflow="hidden",
+            overflow="auto",
             align_items="stretch",
             spacing="0",
         ),
@@ -1711,81 +2196,151 @@ def stock_page() -> rx.Component:
 
 def sales_page() -> rx.Component:
     def catalog_row(product: rx.Var) -> rx.Component:
-        return rx.hstack(
+        return rx.vstack(
+            rx.cond(
+                product["imagem_url"] != "",
+                rx.image(
+                    src=product["imagem_url"],
+                    alt=product["nome"],
+                    width="100%",
+                    height="150px",
+                    object_fit="contain",
+                    background="#f8fafc",
+                    border_radius="12px",
+                ),
+                rx.box(
+                    rx.icon("pill", size=34, color="#16a34a"),
+                    width="100%",
+                    height="150px",
+                    display="flex",
+                    align_items="center",
+                    justify_content="center",
+                    background="#f0fdf4",
+                    border_radius="12px",
+                ),
+            ),
             rx.vstack(
-                rx.text(product["nome"], color="#1f2c39", font_weight="700"),
                 rx.text(
-                    "R$ ",
-                    product["preco"],
-                    " · Estoque: ",
-                    product["estoque_quantidade"],
-                    color="#64748b",
-                    font_size="0.85rem",
+                    product["nome"],
+                    color="#1f2c39",
+                    font_weight="700",
+                    font_size="1rem",
+                ),
+                rx.text("R$ ", product["preco_formatado"], color="#16a34a", font_size="1.15rem", font_weight="800"),
+                rx.text("Disponível: ", product["estoque_quantidade"], color="#64748b", font_size="0.82rem"),
+                rx.text(
+                    product["cart_status"],
+                    color=product["cart_status_color"],
+                    font_size="0.82rem",
+                    font_weight="600",
                 ),
                 align_items="flex-start",
-                spacing="1",
+                spacing="2",
                 width="100%",
             ),
             rx.button(
+                rx.icon("plus", size=16),
                 "Adicionar",
                 on_click=LoginState.add_to_cart(product["id"]),
-                size="2",
+                size="3",
                 background="#16a34a",
                 color="white",
+                width="100%",
             ),
             width="100%",
-            padding="0.85rem 1rem",
-            border_bottom="1px solid #e5e7eb",
-            align_items="center",
+            padding="1rem",
+            background="white",
+            border="1px solid #e5e7eb",
+            border_radius="16px",
+            align_items="stretch",
             spacing="3",
+            min_width="0",
+            max_width="100%",
+            _hover={"box_shadow": "0 8px 24px rgba(15,23,42,0.08)", "border_color": "#86efac"},
         )
 
     def cart_row(item: rx.Var) -> rx.Component:
-        return rx.hstack(
-            rx.vstack(
-                rx.text(item["nome"], color="#1f2c39", font_weight="600"),
+        return rx.vstack(
+            rx.hstack(
+                rx.text(
+                    item["nome"],
+                    color="#1f2c39",
+                    font_weight="600",
+                    flex="1",
+                    min_width="0",
+                    white_space="normal",
+                ),
+                width="100%",
+                align_items="flex-start",
+            ),
+            rx.hstack(
                 rx.text(
                     "R$ ",
-                    item["preco"],
+                    item["preco_formatado"],
                     " cada",
                     color="#64748b",
-                    font_size="0.82rem",
+                    font_size="0.8rem",
+                    flex="1",
+                    min_width="0",
                 ),
-                align_items="flex-start",
-                spacing="1",
+                rx.hstack(
+                    rx.button(
+                        "−",
+                        on_click=LoginState.change_cart_quantity(item["produto_id"], -1),
+                        variant="outline",
+                        size="1",
+                        min_width="32px",
+                        padding="0",
+                    ),
+                    rx.text(
+                        item["quantidade"],
+                        color="#1f2c39",
+                        font_weight="700",
+                        min_width="20px",
+                        text_align="center",
+                    ),
+                    rx.button(
+                        "+",
+                        on_click=LoginState.change_cart_quantity(item["produto_id"], 1),
+                        variant="outline",
+                        size="1",
+                        min_width="32px",
+                        padding="0",
+                    ),
+                    align_items="center",
+                    spacing="1",
+                    flex_shrink="0",
+                ),
                 width="100%",
-            ),
-            rx.button(
-                "−",
-                on_click=LoginState.change_cart_quantity(item["produto_id"], -1),
-                variant="outline",
-                size="1",
-            ),
-            rx.text(item["quantidade"], color="#1f2c39", font_weight="700"),
-            rx.button(
-                "+",
-                on_click=LoginState.change_cart_quantity(item["produto_id"], 1),
-                variant="outline",
-                size="1",
+                align_items="center",
+                spacing="2",
             ),
             width="100%",
-            padding="0.7rem 0",
-            align_items="center",
+            min_width="0",
+            padding="0.7rem",
+            align_items="stretch",
             spacing="2",
+            border_bottom="1px solid #e5e7eb",
         )
 
     def sale_row(sale: rx.Var) -> rx.Component:
         return rx.hstack(
-            rx.text("#", sale["id"], color="#1f2c39", font_weight="700", width="16%"),
+            rx.text(
+                "#",
+                sale["id"],
+                color="#1f2c39",
+                font_weight="700",
+                width=["100%", "16%"],
+            ),
             rx.text(
                 "Cliente: ",
                 sale["cliente_id"],
                 color="#64748b",
-                width="24%",
+                width=["100%", "24%"],
             ),
-            rx.text("R$ ", sale["valor_total"], color="#1f2c39", width="24%"),
-            rx.text(sale["forma_pagamento"], color="#475569", width="20%"),
-            rx.text(sale["criado_em"], color="#64748b", font_size="0.82rem", width="16%"),
+            rx.text("R$ ", sale["valor_total"], color="#1f2c39", width=["100%", "24%"]),
+            rx.text(sale["forma_pagamento"], color="#475569", width=["100%", "20%"]),
+            rx.text(sale["criado_em"], color="#64748b", font_size="0.82rem", width=["100%", "16%"]),
             width="100%",
             padding="0.85rem 1rem",
             border_bottom="1px solid #e5e7eb",
@@ -1794,6 +2349,98 @@ def sales_page() -> rx.Component:
         )
 
     content = rx.vstack(
+        rx.hstack(
+            rx.spacer(),
+            rx.dialog.root(
+                rx.dialog.trigger(
+                    rx.button(
+                        rx.icon("history", size=17),
+                        "Histórico",
+                        variant="outline",
+                        color="#15803d",
+                        border_color="#86efac",
+                        background="white",
+                    )
+                ),
+                rx.dialog.content(
+                    rx.vstack(
+                        rx.hstack(
+                            rx.dialog.title(
+                                "Histórico de vendas",
+                                color="#1f2c39",
+                                size="4",
+                            ),
+                            rx.spacer(),
+                            rx.dialog.close(
+                                rx.button(
+                                    rx.icon("x", size=18),
+                                    variant="ghost",
+                                    color="#64748b",
+                                    aria_label="Fechar histórico",
+                                )
+                            ),
+                            width="100%",
+                            align_items="center",
+                        ),
+                        rx.hstack(
+                            rx.text("Venda", width=["100%", "16%"], font_weight="700", color="#475569"),
+                            rx.text("Cliente", width=["100%", "24%"], font_weight="700", color="#475569"),
+                            rx.text("Total", width=["100%", "24%"], font_weight="700", color="#475569"),
+                            rx.text("Pagamento", width=["100%", "20%"], font_weight="700", color="#475569"),
+                            rx.text("Data", width=["100%", "16%"], font_weight="700", color="#475569"),
+                            width="100%",
+                            padding="0.9rem 1rem",
+                            border_bottom="1px solid #e5e7eb",
+                            flex_wrap="wrap",
+                        ),
+                        rx.foreach(LoginState.sales, sale_row),
+                        rx.cond(
+                            LoginState.is_loading_sales,
+                            rx.text(
+                                "Carregando histórico do Xano...",
+                                color="#64748b",
+                                padding="1rem",
+                            ),
+                            rx.fragment(),
+                        ),
+                        rx.cond(
+                            (LoginState.sales.length() == 0)
+                            & (LoginState.is_loading_sales == False),
+                            rx.text(
+                                "Nenhuma venda registrada ainda.",
+                                color="#64748b",
+                                padding="1rem",
+                            ),
+                            rx.fragment(),
+                        ),
+                        rx.hstack(
+                            rx.spacer(),
+                            rx.button(
+                                "Atualizar",
+                                on_click=LoginState.load_sales,
+                                loading=LoginState.is_loading_sales,
+                                variant="outline",
+                            ),
+                            width="100%",
+                        ),
+                        width="100%",
+                        padding="0.25rem",
+                        spacing="2",
+                        align_items="stretch",
+                    ),
+                    width="min(94vw, 900px)",
+                    max_height="85vh",
+                    overflow_y="auto",
+                    padding="1.4rem",
+                    background="white",
+                    border="1px solid #e2e8f0",
+                    border_radius="18px",
+                    box_shadow="0 24px 80px rgba(15,23,42,0.24)",
+                ),
+            ),
+            width="100%",
+            align_items="center",
+        ),
         rx.cond(
             LoginState.sales_error != "",
             rx.text(LoginState.sales_error, color="#dc2626", role="alert"),
@@ -1803,90 +2450,32 @@ def sales_page() -> rx.Component:
             rx.vstack(
                 rx.heading("Catálogo", color="#1f2c39", size="4"),
                 rx.input(
-                    placeholder="Buscar produtos no estoque",
+                    placeholder="Buscar por nome ou código de barras",
                     value=LoginState.product_search,
                     on_change=LoginState.set_product_search,
                     width="100%",
                     background="white",
                 ),
-                rx.vstack(
+                rx.grid(
                     rx.foreach(LoginState.filtered_products, catalog_row),
+                    columns="repeat(auto-fill, minmax(min(100%, 210px), 1fr))",
+                    gap="1rem",
                     width="100%",
-                    max_height="420px",
-                    overflow_y="auto",
-                    background="white",
-                    border="1px solid #e5e7eb",
-                    border_radius="14px",
-                    align_items="stretch",
-                    spacing="0",
+                    padding="0.15rem",
+                    min_width="0",
+                ),
+                rx.cond(
+                    (LoginState.filtered_products.length() == 0)
+                    & (LoginState.is_loading_sales == False),
+                    rx.text(
+                        "Nenhum produto encontrado no catálogo.",
+                        color="#64748b",
+                        padding="1rem 0",
+                    ),
+                    rx.fragment(),
                 ),
                 width="100%",
-                padding="1.2rem",
-                background="white",
-                border="1px solid #e5e7eb",
-                border_radius="16px",
-                spacing="3",
-                align_items="stretch",
-            ),
-            rx.vstack(
-                rx.heading("Carrinho", color="#1f2c39", size="4"),
-                rx.text(
-                    "Itens: ",
-                    LoginState.cart_item_count,
-                    color="#64748b",
-                ),
-                rx.vstack(
-                    rx.foreach(LoginState.cart, cart_row),
-                    width="100%",
-                    align_items="stretch",
-                    spacing="1",
-                ),
-                rx.input(
-                    placeholder="Cliente (opcional)",
-                    value=LoginState.selected_customer,
-                    on_change=LoginState.set_selected_customer,
-                    width="100%",
-                    background="white",
-                ),
-                rx.text("Forma de pagamento", color="#475569", font_weight="600"),
-                rx.select(
-                    ["Dinheiro", "PIX", "Crédito", "Débito"],
-                    value=LoginState.payment_method,
-                    on_change=LoginState.set_payment_method,
-                    width="100%",
-                ),
-                rx.hstack(
-                    rx.text("Total", color="#475569", font_weight="700"),
-                    rx.spacer(),
-                    rx.text("R$ ", LoginState.cart_total, color="#1f2c39", font_size="1.35rem", font_weight="800"),
-                    width="100%",
-                    padding_top="0.8rem",
-                    border_top="1px solid #e5e7eb",
-                ),
-                rx.text(
-                    "Carrinho demonstrativo: o checkout e a baixa de estoque serão conectados após a criação do endpoint transacional no Xano.",
-                    color="#a16207",
-                    font_size="0.82rem",
-                    role="status",
-                ),
-                rx.hstack(
-                    rx.button(
-                        "Limpar carrinho",
-                        on_click=LoginState.clear_cart,
-                        variant="outline",
-                        width="100%",
-                    ),
-                    rx.button(
-                        "Finalização pendente",
-                        disabled=True,
-                        width="100%",
-                        background="#94a3b8",
-                        color="white",
-                    ),
-                    width="100%",
-                    flex_wrap="wrap",
-                ),
-                width="100%",
+                min_width="0",
                 padding="1.2rem",
                 background="white",
                 border="1px solid #e5e7eb",
@@ -1895,58 +2484,417 @@ def sales_page() -> rx.Component:
                 align_items="stretch",
             ),
             width="100%",
-            align_items="flex-start",
-            spacing="4",
-            flex_wrap="wrap",
-        ),
-        rx.vstack(
-            rx.hstack(
-                rx.heading("Histórico de vendas", color="#1f2c39", size="4"),
-                rx.spacer(),
-                rx.button(
-                    "Atualizar",
-                    on_click=LoginState.load_sales,
-                    loading=LoginState.is_loading_sales,
-                    variant="outline",
-                ),
-                width="100%",
-                align_items="center",
-            ),
-            rx.hstack(
-                rx.text("Venda", width="16%", font_weight="700", color="#475569"),
-                rx.text("Cliente", width="24%", font_weight="700", color="#475569"),
-                rx.text("Total", width="24%", font_weight="700", color="#475569"),
-                rx.text("Pagamento", width="20%", font_weight="700", color="#475569"),
-                rx.text("Data", width="16%", font_weight="700", color="#475569"),
-                width="100%",
-                padding="0.9rem 1rem",
-                border_bottom="1px solid #e5e7eb",
-                flex_wrap="wrap",
-            ),
-            rx.foreach(LoginState.sales, sale_row),
-            rx.cond(
-                LoginState.is_loading_sales,
-                rx.text("Carregando histórico do Xano...", color="#64748b", padding="1rem"),
-                rx.fragment(),
-            ),
-            rx.cond(
-                (LoginState.sales.length() == 0)
-                & (LoginState.is_loading_sales == False),
-                rx.text(
-                    "Nenhuma venda registrada ainda.",
-                    color="#64748b",
-                    padding="1rem",
-                ),
-                rx.fragment(),
-            ),
-            width="100%",
-            padding="1.2rem",
-            background="white",
-            border="1px solid #e5e7eb",
-            border_radius="16px",
-            spacing="2",
             align_items="stretch",
-            overflow_x="auto",
+            spacing="4",
+        ),
+        rx.cond(
+            LoginState.cart.length() > 0,
+            rx.dialog.root(
+                rx.dialog.trigger(
+                    rx.button(
+                        rx.icon("shopping-cart", size=21),
+                        rx.text("Ver carrinho", display=["none", "block"]),
+                        rx.text(
+                            "R$ ",
+                            LoginState.cart_final_total_formatted,
+                            font_weight="800",
+                            font_size="1.05rem",
+                        ),
+                        rx.badge(
+                            LoginState.cart_item_count,
+                            color_scheme="green",
+                            variant="solid",
+                            border_radius="999px",
+                        ),
+                        position="fixed",
+                        right="24px",
+                        bottom="24px",
+                        z_index="1000",
+                        background="#16a34a",
+                        color="white",
+                        border_radius="999px",
+                        padding="0.9rem 1.2rem",
+                        height="58px",
+                        box_shadow="0 12px 32px rgba(22,163,74,0.35)",
+                        _hover={"background": "#15803d", "transform": "translateY(-2px)"},
+                    )
+                ),
+                rx.dialog.content(
+                    rx.vstack(
+                        rx.hstack(
+                            rx.vstack(
+                                rx.dialog.title(
+                                    "Seu carrinho",
+                                    color="#1f2c39",
+                                    font_size="1.35rem",
+                                    font_weight="700",
+                                ),
+                                rx.text(
+                                    "Itens selecionados: ",
+                                    LoginState.cart_item_count,
+                                    color="#64748b",
+                                    font_size="0.88rem",
+                                ),
+                                align_items="flex-start",
+                                spacing="1",
+                            ),
+                            rx.dialog.close(
+                                rx.button(
+                                    rx.icon("x", size=18),
+                                    variant="ghost",
+                                    color="#64748b",
+                                    aria_label="Fechar carrinho",
+                                    on_click=LoginState.set_cart_panel_open(False),
+                                )
+                            ),
+                            width="100%",
+                            justify="between",
+                        ),
+                        rx.vstack(
+                            rx.foreach(LoginState.cart, cart_row),
+                            width="100%",
+                            align_items="stretch",
+                            spacing="1",
+                        ),
+                        rx.vstack(
+                            rx.text(
+                                "Identificação do cliente (opcional)",
+                                color="#475569",
+                                font_weight="700",
+                                font_size="0.9rem",
+                            ),
+                            rx.grid(
+                                rx.button(
+                                    rx.icon("user-round-plus", size=14),
+                                    "Criar cadastro",
+                                    on_click=LoginState.open_customer_form,
+                                    variant="outline",
+                                    color="#15803d",
+                                    border_color="#86efac",
+                                    size="2",
+                                    width="100%",
+                                    min_width="0",
+                                    padding="0.4rem 0.25rem",
+                                    font_size="0.75rem",
+                                    white_space="normal",
+                                    line_height="1.15",
+                                ),
+                                rx.button(
+                                    rx.icon("user-round-check", size=14),
+                                    "Cliente cadastrado",
+                                    on_click=LoginState.set_customer_status("registered"),
+                                    variant=rx.cond(
+                                        LoginState.customer_status == "registered",
+                                        "solid",
+                                        "outline",
+                                    ),
+                                    background=rx.cond(
+                                        LoginState.customer_status == "registered",
+                                        "#16a34a",
+                                        "white",
+                                    ),
+                                    color=rx.cond(
+                                        LoginState.customer_status == "registered",
+                                        "white",
+                                        "#475569",
+                                    ),
+                                    size="2",
+                                    width="100%",
+                                    min_width="0",
+                                    padding="0.4rem 0.25rem",
+                                    font_size="0.75rem",
+                                    white_space="normal",
+                                    line_height="1.15",
+                                ),
+                                columns="repeat(2, minmax(0, 1fr))",
+                                gap="0.5rem",
+                                width="100%",
+                                min_width="0",
+                            ),
+                            rx.cond(
+                                LoginState.customer_status == "registered",
+                                rx.vstack(
+                                    rx.select(
+                                        LoginState.customer_options,
+                                        value=LoginState.selected_customer,
+                                        on_change=LoginState.set_selected_customer,
+                                        placeholder="Selecione o cliente cadastrado",
+                                        width="100%",
+                                        color="#111827",
+                                        background="white",
+                                        _placeholder={"color": "#111827"},
+                                    ),
+                                    rx.cond(
+                                        LoginState.selected_customer_is_registered,
+                                        rx.text(
+                                            f"Desconto de {CUSTOMER_DISCOUNT_RATE}% aplicado.",
+                                            color="#15803d",
+                                            font_size="0.86rem",
+                                            font_weight="600",
+                                            role="status",
+                                        ),
+                                        rx.text(
+                                            "Selecione um cliente para aplicar o desconto.",
+                                            color="#64748b",
+                                            font_size="0.86rem",
+                                        ),
+                                    ),
+                                    width="100%",
+                                    align_items="stretch",
+                                    spacing="2",
+                                ),
+                                rx.text(
+                                    "Compra sem identificação de cliente.",
+                                    color="#64748b",
+                                    font_size="0.86rem",
+                                ),
+                            ),
+                            rx.text(
+                                "Você pode continuar sem selecionar um cliente.",
+                                color="#64748b",
+                                font_size="0.76rem",
+                            ),
+                            width="100%",
+                            min_width="0",
+                            padding="0.75rem",
+                            background="#f8fafc",
+                            border="1px solid #e2e8f0",
+                            border_radius="12px",
+                            align_items="stretch",
+                            spacing="2",
+                        ),
+                        rx.cond(
+                            LoginState.customer_notice != "",
+                            rx.text(LoginState.customer_notice, color="#15803d", role="status"),
+                            rx.fragment(),
+                        ),
+                        rx.hstack(
+                            rx.text("Subtotal", color="#475569"),
+                            rx.spacer(),
+                            rx.text(
+                                "R$ ",
+                                LoginState.cart_total_formatted,
+                                color="#1f2c39",
+                                font_weight="600",
+                            ),
+                            width="100%",
+                        ),
+                        rx.cond(
+                            LoginState.selected_customer_is_registered,
+                            rx.hstack(
+                                rx.text(
+                                    f"Desconto ({CUSTOMER_DISCOUNT_RATE}%)",
+                                    color="#15803d",
+                                    font_weight="600",
+                                ),
+                                rx.spacer(),
+                                rx.text(
+                                    "− R$ ",
+                                    LoginState.cart_discount_formatted,
+                                    color="#15803d",
+                                    font_weight="700",
+                                ),
+                                width="100%",
+                            ),
+                            rx.fragment(),
+                        ),
+                        rx.hstack(
+                            rx.text("Total", color="#475569", font_weight="700"),
+                            rx.spacer(),
+                            rx.text(
+                                "R$ ",
+                                LoginState.cart_final_total_formatted,
+                                color="#1f2c39",
+                                font_size="1.35rem",
+                                font_weight="800",
+                            ),
+                            width="100%",
+                            padding_top="0.8rem",
+                            border_top="1px solid #e5e7eb",
+                        ),
+                        rx.text("Forma de pagamento", color="#475569", font_weight="600"),
+                        rx.select(
+                            ["Dinheiro", "PIX", "Crédito", "Débito"],
+                            value=LoginState.payment_method,
+                            on_change=LoginState.set_payment_method,
+                            width="100%",
+                            color="#111827",
+                            background="white",
+                        ),
+                        rx.text(
+                            "A finalização demonstrativa ainda não grava a venda nem atualiza o estoque.",
+                            color="#a16207",
+                            font_size="0.82rem",
+                            role="status",
+                        ),
+                        rx.hstack(
+                            rx.button(
+                                "Limpar carrinho",
+                                on_click=LoginState.clear_cart,
+                                variant="outline",
+                                width="100%",
+                            ),
+                            rx.button(
+                                "Finalização pendente",
+                                disabled=True,
+                                width="100%",
+                                background="#94a3b8",
+                                color="white",
+                            ),
+                            width="100%",
+                            flex_wrap="wrap",
+                        ),
+                        width="100%",
+                        spacing="3",
+                        align_items="stretch",
+                    ),
+                    width="min(94vw, 460px)",
+                    max_height="min(90vh, 820px)",
+                    overflow_y="auto",
+                    padding="1.4rem",
+                    background="white",
+                    border="1px solid #e2e8f0",
+                    border_radius="18px",
+                    box_shadow="0 24px 80px rgba(15,23,42,0.24)",
+                    position="fixed",
+                    top="auto",
+                    right="16px",
+                    bottom="16px",
+                    left="auto",
+                    transform="none",
+                ),
+                open=LoginState.show_cart_panel,
+                on_open_change=LoginState.set_cart_panel_open,
+            ),
+            rx.fragment(),
+        ),
+        rx.dialog.root(
+            rx.dialog.content(
+                rx.vstack(
+                    rx.hstack(
+                        rx.vstack(
+                            rx.dialog.title(
+                                "Cadastrar cliente",
+                                color="#1f2c39",
+                                font_size="1.35rem",
+                                font_weight="700",
+                            ),
+                            rx.dialog.description(
+                                f"Clientes cadastrados recebem {CUSTOMER_DISCOUNT_RATE}% de desconto no carrinho.",
+                                color="#64748b",
+                                font_size="0.9rem",
+                            ),
+                            align_items="flex-start",
+                            spacing="1",
+                        ),
+                        rx.dialog.close(
+                            rx.button(
+                                rx.icon("x", size=18),
+                                variant="ghost",
+                                color="#64748b",
+                                aria_label="Fechar cadastro de cliente",
+                            )
+                        ),
+                        width="100%",
+                        justify="between",
+                        align_items="flex-start",
+                    ),
+                    rx.cond(
+                        LoginState.customer_form_error != "",
+                        rx.text(
+                            LoginState.customer_form_error,
+                            color="#b91c1c",
+                            background="#fef2f2",
+                            padding="0.75rem 0.9rem",
+                            border="1px solid #fecaca",
+                            border_radius="10px",
+                            font_size="0.88rem",
+                            role="alert",
+                            width="100%",
+                        ),
+                        rx.fragment(),
+                    ),
+                    rx.vstack(
+                        rx.text("Nome completo", color="#34485b", font_weight="600"),
+                        rx.input(
+                            placeholder="Nome do cliente",
+                            value=LoginState.customer_name,
+                            on_change=LoginState.set_customer_name,
+                            width="100%",
+                        ),
+                        width="100%",
+                        align_items="stretch",
+                        spacing="2",
+                    ),
+                    rx.vstack(
+                        rx.text("CPF", color="#34485b", font_weight="600"),
+                        rx.input(
+                            placeholder="000.000.000-00",
+                            value=LoginState.customer_cpf,
+                            on_change=LoginState.set_customer_cpf,
+                            width="100%",
+                        ),
+                        width="100%",
+                        align_items="stretch",
+                        spacing="2",
+                    ),
+                    rx.vstack(
+                        rx.text("Telefone", color="#34485b", font_weight="600"),
+                        rx.input(
+                            placeholder="(00) 00000-0000",
+                            value=LoginState.customer_phone,
+                            on_change=LoginState.set_customer_phone,
+                            type="tel",
+                            width="100%",
+                        ),
+                        width="100%",
+                        align_items="stretch",
+                        spacing="2",
+                    ),
+                    rx.hstack(
+                        rx.dialog.close(
+                            rx.button(
+                                "Cancelar",
+                                variant="outline",
+                                color="#475569",
+                                border_color="#cbd5e1",
+                                height="44px",
+                                padding="0 1.2rem",
+                            )
+                        ),
+                        rx.button(
+                            rx.cond(
+                                LoginState.is_saving_customer,
+                                "Cadastrando...",
+                                "Cadastrar e aplicar desconto",
+                            ),
+                            on_click=LoginState.save_customer,
+                            loading=LoginState.is_saving_customer,
+                            background="#16a34a",
+                            color="white",
+                            height="44px",
+                            padding="0 1.3rem",
+                            border_radius="10px",
+                        ),
+                        width="100%",
+                        justify="end",
+                        spacing="3",
+                    ),
+                    width="100%",
+                    spacing="4",
+                    align_items="stretch",
+                ),
+                width="min(92vw, 520px)",
+                max_height="90vh",
+                overflow_y="auto",
+                padding="1.6rem",
+                background="white",
+                border="1px solid #e2e8f0",
+                border_radius="18px",
+                box_shadow="0 24px 80px rgba(15,23,42,0.24)",
+            ),
+            open=LoginState.show_customer_form,
+            on_open_change=LoginState.set_customer_form_open,
         ),
         width="100%",
         spacing="4",

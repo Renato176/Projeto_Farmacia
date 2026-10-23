@@ -13,7 +13,7 @@ Preparar no Xano a estrutura inicial do banco para o sistema de farmacia DROGA-N
 | Tabela | ID no Xano | Finalidade | Campos principais |
 |---|---:|---|---|
 | `cliente` | `908187` | Cadastro de clientes | `nome`, `cpf`, `telefone`, `esta_registrado`, `criado_em`, `atualizado_em` |
-| `produto` | `908189` | Catalogo e estoque | `nome`, `codigo_barras`, `preco`, `estoque_quantidade`, `criado_em`, `atualizado_em` |
+| `produto` | `908189` | Catalogo e estoque | `nome`, `codigo_barras`, `preco`, `estoque_quantidade`, `imagem_url`, `criado_em`, `atualizado_em` |
 | `venda` | `908190` | Vendas processadas por usuarios | `usuario_id`, `cliente_id`, `valor_total`, `desconto_aplicado`, `criado_em`, `atualizado_em` |
 | `item_venda` | `908192` | Produtos e quantidades de cada venda | `venda_id`, `produto_id`, `quantidade`, `preco_unitario`, `criado_em` |
 
@@ -76,10 +76,26 @@ Foi criado o grupo privado `Farmacia` (`api:M6el3Cg8`) para as operacoes de esto
 | `PUT /produto/{id}` | Atualizar produto |
 | `DELETE /produto/{id}` | Excluir produto |
 | `GET /cliente` | Listar clientes |
+| `POST /cliente` | Cadastrar cliente para uso na tela de vendas |
 | `GET /venda` | Consultar historico de vendas |
 | `POST /venda` | Criar venda |
 | `POST /item_venda` | Criar item de venda |
 
 Foi adicionado a `venda` o campo enum `forma_pagamento`, com os valores `dinheiro`, `pix`, `credito` e `debito`.
 
-O frontend usa `GET /produto`, `GET /cliente` e `GET /venda` para carregar estoque e o catalogo/historico da tela de vendas. As telas de estoque tambem enviam `POST`, `PUT` e `DELETE` para produtos. Embora as rotas de gravacao de venda e item estejam preparadas no Xano, o checkout ainda nao as chama: a finalizacao de venda e a baixa de estoque permanecem pendentes de um endpoint transacional e da aprovacao do escopo correspondente. As respostas de listagem devem ser confirmadas como listas JSON no ambiente Xano antes do uso integrado.
+O frontend usa `GET /produto`, `GET /cliente` e `GET /venda` para carregar estoque e o catalogo/historico da tela de vendas. A tela de estoque envia `POST` e `PUT` para incluir e editar produtos; a rota `DELETE` existe no Xano, mas nao e oferecida na interface. Embora as rotas de gravacao de venda e item estejam preparadas no Xano, o checkout ainda nao as chama: a finalizacao de venda e a baixa de estoque permanecem pendentes de um endpoint transacional e da aprovacao do escopo correspondente. As respostas de listagem devem ser confirmadas como listas JSON no ambiente Xano antes do uso integrado.
+
+Foi criado o endpoint autenticado `POST /cliente` (`4105447`) no grupo `Farmacia` para salvar `nome`, `cpf`, `telefone` e `esta_registrado`. A tela de vendas apresenta os produtos em cartoes com foto, preco e estoque; adicionar um item inicia sua quantidade em 1, permite incluir outros produtos e alterar quantidades dentro do estoque disponivel. Ao selecionar produtos, um botao flutuante no canto inferior direito mostra o total e a quantidade de itens. Ao abrir o carrinho, o operador pode alterar/remover itens, escolher compra sem cadastro ou identificar um cliente cadastrado, ou cadastrar um novo cliente. Clientes com `esta_registrado = true` recebem desconto de 14% no total demonstrativo do carrinho. O historico fica acessivel pelo botao `Historico` no topo da tela, sem ocupar espaco fixo junto ao catalogo; a lista de produtos usa o fluxo normal da pagina em vez de uma area rolavel interna.
+
+O cadastro foi conferido na configuracao do endpoint, sem gravar dados pessoais de teste. A finalizacao permanece desativada; portanto, o desconto ainda e apenas calculado e exibido no carrinho, nao gravado em uma venda.
+
+### Foto do produto
+
+A tabela `produto` possui o campo opcional de texto `imagem_url`, visivel para a API, para armazenar o endereco da imagem do produto. O campo foi configurado nos endpoints de gravacao da workspace `169234-0` (`v1` / `live`):
+
+| Metodo e rota | ID no Xano | Configuracao |
+|---|---:|---|
+| `POST /produto` | `4103434` | `imagem_url` recebe `input.imagem_url` e e gravado no novo registro. |
+| `PUT /produto/{produto_id}` | `4103438` | `imagem_url` recebe `input.imagem_url` e e gravado na atualizacao do registro correspondente. |
+
+O frontend pode enviar a URL tanto na inclusao quanto na edicao; a listagem usa o valor retornado para exibir a foto. Produtos sem URL continuam sem imagem e podem mostrar o espaco reservado da interface. A persistencia foi conferida na configuracao dos endpoints, mas nao foi feita uma chamada de teste que criasse ou alterasse um produto real.
