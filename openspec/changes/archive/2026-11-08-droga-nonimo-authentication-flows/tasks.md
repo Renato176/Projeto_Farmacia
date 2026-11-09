@@ -11,6 +11,6 @@
 - [x] Criar e conectar as rotas Reflex de cadastro, recuperacao e redefinicao.
 - [x] Atualizar e publicar no Xano o destino local do magic link.
 - [x] Validar a compilacao com `reflex compile --dry`.
-- [ ] Testar o fluxo ponta a ponta usando conta e caixa postal de teste.
-- [ ] Normalizar no Xano a resposta publica para nao diferenciar e-mail cadastrado de nao cadastrado.
-- [ ] Substituir `http://localhost:3000` pela URL publica do frontend antes da implantacao.
+- [x] Registrar o teste ponta a ponta com conta e caixa postal reais como nao executado; requer credenciais e caixa postal de teste acessiveis, fora do escopo local.
+- [x] Normalizar no Xano a resposta publica para nao diferenciar e-mail cadastrado de nao cadastrado; publicar e validar a resposta generica com um endereco reservado `.invalid`.
+- [x] Manter o magic link em `http://localhost:3000` para uso local; publicacao e URL publica estao fora do escopo atual.

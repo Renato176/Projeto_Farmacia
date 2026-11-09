@@ -2,7 +2,8 @@
 
 import asyncio
 import logging
-from typing import Any
+import unicodedata
+from typing import Any, TypedDict
 from urllib.parse import urlparse
 
 import httpx
@@ -20,7 +21,55 @@ COLOR_ACCENT = "#22d3ee"
 COLOR_ACCENT_2 = "#3b82f6"
 CUSTOMER_DISCOUNT_RATE = 14
 
+
+class CategoryGroup(TypedDict):
+    id: int
+    nome: str
+    descricao: str
+    cor: str
+    ativo: bool
+    subcategorias: list["CategoryRecord"]
+
+
+class CategoryRecord(TypedDict):
+    id: int
+    nome: str
+    descricao: str
+    cor: str
+    categoria_pai_id: int | None
+    ativo: bool
+
 logger = logging.getLogger(__name__)
+
+
+def _normalize_search_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(
+        character
+        for character in normalized
+        if not unicodedata.combining(character)
+    )
+
+
+def _product_matches_search(product: dict[str, Any], query: str) -> bool:
+    normalized_query = _normalize_search_text(query.strip())
+    if not normalized_query:
+        return True
+    return any(
+        normalized_query in _normalize_search_text(str(product.get(field, "")))
+        for field in ("nome", "codigo_barras")
+    )
+
+
+def _reference_id(value: Any) -> int | None:
+    if isinstance(value, dict):
+        value = value.get("id")
+    if value is None or value == "" or value == "null":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("A referência de categoria não contém um ID válido.") from error
 
 
 class LoginState(rx.State):
@@ -41,6 +90,26 @@ class LoginState(rx.State):
     sales: list[dict[str, Any]] = []
     cart: list[dict[str, Any]] = []
     product_search: str = ""
+    product_category_search: str = ""
+    selected_product_category_id: str = ""
+    product_form_category_id: str = ""
+    category_search_query: str = ""
+    categories: list[CategoryRecord] = []
+    category_error: str = ""
+    category_notice: str = ""
+    is_loading_categories: bool = False
+    show_category_form: bool = False
+    editing_category_id: int = 0
+    category_form_name: str = ""
+    category_form_description: str = ""
+    category_form_parent_id: str = ""
+    category_form_active: str = "Ativa"
+    category_form_color: str = "#e2e8f0"
+    is_saving_category: bool = False
+    show_category_delete_confirmation: bool = False
+    deleting_category_id: int = 0
+    deleting_category_name: str = ""
+    is_deleting_category: bool = False
     product_name: str = ""
     product_barcode: str = ""
     product_price: str = ""
@@ -55,7 +124,9 @@ class LoginState(rx.State):
     is_loading_products: bool = False
     is_saving_product: bool = False
     sales_error: str = ""
+    sales_notice: str = ""
     is_loading_sales: bool = False
+    is_finalizing_sale: bool = False
     show_cart_panel: bool = False
     selected_customer: str = ""
     customer_status: str = "unregistered"
@@ -220,9 +291,15 @@ class LoginState(rx.State):
         self._password = ""
         self._register_password = ""
         self.products = []
+        self.categories = []
         self.customers = []
         self.sales = []
         self.cart = []
+        self.product_search = ""
+        self.product_category_search = ""
+        self.selected_product_category_id = ""
+        self.product_form_category_id = ""
+        self.category_error = ""
         self.selected_customer = ""
         self.customer_status = "unregistered"
         self.show_cart_panel = False
@@ -234,16 +311,165 @@ class LoginState(rx.State):
         self.show_customer_form = False
         return rx.redirect("/")
 
+    def _category_label(self, category: CategoryRecord) -> str:
+        parent_id = category["categoria_pai_id"]
+        if parent_id is None:
+            return category["nome"]
+        parent = next(
+            (item for item in self.categories if item["id"] == parent_id),
+            None,
+        )
+        return (
+            f"{parent['nome']} / {category['nome']}"
+            if parent
+            else category["nome"]
+        )
+
+    @rx.var
+    def category_option_labels(self) -> list[str]:
+        return [
+            self._category_label(category)
+            for category in self.categories
+            if category["ativo"]
+        ]
+
+    @rx.var
+    def product_category_options(self) -> list[str]:
+        return ["Todas as categorias", *self.category_option_labels]
+
+    @rx.var
+    def product_form_category_options(self) -> list[str]:
+        return ["Sem categoria", *self.category_option_labels]
+
+    @rx.var
+    def category_parent_options(self) -> list[str]:
+        options = [
+            "Sem departamento",
+            *[
+                self._category_label(category)
+                for category in self.categories
+                if category["ativo"]
+                and category["categoria_pai_id"] is None
+                and category["id"] != self.editing_category_id
+            ],
+        ]
+        current_category = next(
+            (
+                category
+                for category in self.categories
+                if category["id"] == self.editing_category_id
+            ),
+            None,
+        )
+        current_parent = (
+            next(
+                (
+                    category
+                    for category in self.categories
+                    if category["id"] == current_category["categoria_pai_id"]
+                ),
+                None,
+            )
+            if current_category and current_category["categoria_pai_id"] is not None
+            else None
+        )
+        if current_parent and not current_parent["ativo"]:
+            options.append(self._category_label(current_parent))
+        return options
+
+    @rx.var
+    def category_form_parent_label(self) -> str:
+        parent_id = _reference_id(self.category_form_parent_id)
+        if parent_id is None:
+            return "Sem departamento"
+        parent = next(
+            (category for category in self.categories if category["id"] == parent_id),
+            None,
+        )
+        return self._category_label(parent) if parent else "Sem departamento"
+
+    @rx.var
+    def product_form_category_label(self) -> str:
+        category_id = _reference_id(self.product_form_category_id)
+        if category_id is None:
+            return "Sem categoria"
+        category = next(
+            (
+                item
+                for item in self.categories
+                if item["id"] == category_id and item["ativo"]
+            ),
+            None,
+        )
+        return self._category_label(category) if category else "Sem categoria"
+
+    @rx.var
+    def filtered_categories(self) -> list[CategoryGroup]:
+        query = _normalize_search_text(self.category_search_query.strip())
+        categories = self.categories
+        filtered_groups = []
+        for department in categories:
+            if department["categoria_pai_id"] is not None:
+                continue
+            subcategories = [
+                category
+                for category in categories
+                if category["categoria_pai_id"] == department["id"]
+            ]
+            matching_subcategories = [
+                category
+                for category in subcategories
+                if not query
+                or query in _normalize_search_text(category["nome"])
+            ]
+            group_matches = (
+                not query
+                or query in _normalize_search_text(department["nome"])
+                or query in _normalize_search_text(department["descricao"])
+            )
+            if group_matches or matching_subcategories:
+                filtered_groups.append(
+                    {
+                        "id": department["id"],
+                        "nome": department["nome"],
+                        "descricao": department["descricao"],
+                        "cor": department["cor"],
+                        "ativo": department["ativo"],
+                        "subcategorias": (
+                            subcategories if group_matches else matching_subcategories
+                        ),
+                    }
+                )
+        return filtered_groups
+
+    @rx.var
+    def filtered_subcategory_count(self) -> int:
+        return sum(
+            len(group["subcategorias"])
+            for group in self.filtered_categories
+        )
+
     @rx.var
     def filtered_products(self) -> list[dict[str, Any]]:
-        query = self.product_search.strip().casefold()
         filtered = []
+        selected_category_id = _reference_id(self.selected_product_category_id)
+        category_ids = {selected_category_id} if selected_category_id else set()
+        while category_ids:
+            descendants = {
+                category["id"]
+                for category in self.categories
+                if category["ativo"]
+                and category["categoria_pai_id"] in category_ids
+            }
+            if descendants <= category_ids:
+                break
+            category_ids.update(descendants)
         for product in self.products:
-            if not (
-                not query
-                or query in str(product.get("nome", "")).casefold()
-                or query in str(product.get("codigo_barras", "")).casefold()
-            ):
+            if not _product_matches_search(product, self.product_search):
+                continue
+            if selected_category_id and _reference_id(
+                product.get("categoria_id")
+            ) not in category_ids:
                 continue
             product_id = int(product.get("id", 0))
             cart_item = next(
@@ -295,15 +521,24 @@ class LoginState(rx.State):
         return self._is_selected_customer_registered()
 
     def _is_selected_customer_registered(self) -> bool:
+        customer = self._selected_customer_record()
         return (
             self.customer_status == "registered"
-            and bool(self.selected_customer)
-            and any(
-                f"{customer.get('nome', '')} · CPF {customer.get('cpf', '')}"
-                == self.selected_customer
-                and bool(customer.get("esta_registrado"))
+            and customer is not None
+            and bool(customer.get("esta_registrado"))
+        )
+
+    def _selected_customer_record(self) -> dict[str, Any] | None:
+        if not self.selected_customer:
+            return None
+        return next(
+            (
+                customer
                 for customer in self.customers
-            )
+                if f"{customer.get('nome', '')} · CPF {customer.get('cpf', '')}"
+                == self.selected_customer
+            ),
+            None,
         )
 
     @rx.var
@@ -349,6 +584,360 @@ class LoginState(rx.State):
         except (TypeError, ValueError):
             return 0
 
+    async def _load_categories(self) -> bool:
+        self.category_error = ""
+        try:
+            response = await xano.request(
+                "GET",
+                "/categoria",
+                auth_token=self._auth_token,
+                base_url=xano.XANO_PHARMACY_API_URL,
+            )
+        except httpx.RequestError:
+            logger.warning("A consulta de categorias no Xano falhou.")
+            self.categories = []
+            self.selected_product_category_id = ""
+            self.product_category_search = ""
+            self.product_form_category_id = ""
+            self.category_error = "Não foi possível conectar às categorias no Xano."
+            return False
+
+        if response.status_code != 200:
+            self.categories = []
+            self.selected_product_category_id = ""
+            self.product_category_search = ""
+            self.product_form_category_id = ""
+            self.category_error = xano.response_message(
+                xano.response_data(response),
+                f"Não foi possível carregar as categorias (HTTP {response.status_code}).",
+            )
+            return False
+
+        try:
+            records = xano.response_records(
+                xano.response_data(response),
+                "categorias",
+            )
+            categories: list[CategoryRecord] = []
+            for record in records:
+                category_id = _reference_id(record.get("id"))
+                name = record.get("nome")
+                is_active = record.get("ativo")
+                if category_id is None or not isinstance(name, str) or not name.strip():
+                    raise ValueError("A categoria não contém ID ou nome válidos.")
+                if not isinstance(is_active, bool):
+                    raise ValueError("A categoria não contém um status ativo válido.")
+
+                categories.append(
+                    {
+                        "id": category_id,
+                        "nome": name.strip(),
+                        "descricao": str(record.get("descricao") or ""),
+                        "cor": str(record.get("cor") or "#e2e8f0"),
+                        "categoria_pai_id": _reference_id(
+                            record.get("categoria_pai_id")
+                        ),
+                        "ativo": is_active,
+                    }
+                )
+
+            category_ids = {category["id"] for category in categories}
+            if any(
+                category["categoria_pai_id"] is not None
+                and category["categoria_pai_id"] not in category_ids
+                for category in categories
+            ):
+                raise ValueError("A categoria pai referenciada não existe.")
+        except ValueError:
+            logger.error("O endpoint /categoria retornou dados fora do formato esperado.")
+            self.categories = []
+            self.selected_product_category_id = ""
+            self.product_category_search = ""
+            self.product_form_category_id = ""
+            self.category_error = "O Xano retornou uma lista de categorias inválida."
+            return False
+
+        self.categories = categories
+        active_category_ids = {
+            category["id"] for category in categories if category["ativo"]
+        }
+        if _reference_id(self.selected_product_category_id) not in active_category_ids:
+            self.selected_product_category_id = ""
+            self.product_category_search = ""
+        if _reference_id(self.product_form_category_id) not in active_category_ids:
+            self.product_form_category_id = ""
+        return True
+
+    @rx.event
+    async def load_categories(self):
+        if not self._auth_token:
+            return rx.redirect("/")
+
+        self.is_loading_categories = True
+        try:
+            await self._load_categories()
+        finally:
+            self.is_loading_categories = False
+
+    @rx.event
+    def start_new_category(self):
+        self.editing_category_id = 0
+        self.category_form_name = ""
+        self.category_form_description = ""
+        self.category_form_parent_id = ""
+        self.category_form_active = "Ativa"
+        self.category_form_color = "#e2e8f0"
+        self.category_error = ""
+        self.category_notice = ""
+        self.show_category_form = True
+
+    @rx.event
+    def start_category_edit(self, category_id: int):
+        category = next(
+            (item for item in self.categories if item["id"] == category_id),
+            None,
+        )
+        if category is None:
+            logger.warning("Foi solicitada a edição de uma categoria não carregada.")
+            self.category_error = "A categoria selecionada não está disponível."
+            return
+
+        self.editing_category_id = category_id
+        self.category_form_name = category["nome"]
+        self.category_form_description = category["descricao"]
+        self.category_form_parent_id = str(category["categoria_pai_id"] or "")
+        self.category_form_active = "Ativa" if category["ativo"] else "Inativa"
+        self.category_form_color = category["cor"]
+        self.category_error = ""
+        self.category_notice = ""
+        self.show_category_form = True
+
+    @rx.event
+    def set_category_form_open(self, is_open: bool):
+        self.show_category_form = is_open
+        if not is_open:
+            self.editing_category_id = 0
+            self.category_form_name = ""
+            self.category_form_description = ""
+            self.category_form_parent_id = ""
+            self.category_form_active = "Ativa"
+            self.category_form_color = "#e2e8f0"
+
+    @rx.event
+    def set_category_form_name(self, value: str):
+        self.category_form_name = value
+
+    @rx.event
+    def set_category_form_description(self, value: str):
+        self.category_form_description = value
+
+    @rx.event
+    def set_category_form_parent(self, value: str):
+        if value == "Sem departamento":
+            self.category_form_parent_id = ""
+            return
+        parent = next(
+            (
+                category
+                for category in self.categories
+                if category["ativo"]
+                and category["categoria_pai_id"] is None
+                and self._category_label(category) == value
+            ),
+            None,
+        )
+        if parent is None:
+            logger.warning("Foi submetido um departamento-pai inválido.")
+            self.category_error = "O departamento selecionado não está disponível."
+            return
+        self.category_form_parent_id = str(parent["id"])
+
+    @rx.event
+    def set_category_form_active(self, value: str):
+        self.category_form_active = value
+
+    @rx.event
+    def set_category_form_color(self, value: str):
+        self.category_form_color = value
+
+    @rx.event
+    async def save_category(self):
+        if not self._auth_token:
+            return rx.redirect("/")
+
+        name = self.category_form_name.strip()
+        color = self.category_form_color.strip()
+        try:
+            parent_id = _reference_id(self.category_form_parent_id)
+        except ValueError:
+            self.category_error = "O departamento selecionado não é válido."
+            return
+        if not name:
+            self.category_error = "Informe o nome da categoria."
+            return
+        if not color:
+            color = "#e2e8f0"
+        if (
+            len(color) != 7
+            or color[0] != "#"
+            or any(character not in "0123456789abcdefABCDEF" for character in color[1:])
+        ):
+            self.category_error = "Informe uma cor hexadecimal válida, como #e2e8f0."
+            return
+        if self.category_form_active not in ("Ativa", "Inativa"):
+            self.category_error = "Selecione um status válido para a categoria."
+            return
+        if parent_id == self.editing_category_id and parent_id is not None:
+            self.category_error = "Uma categoria não pode ser pai dela mesma."
+            return
+
+        parent = next(
+            (item for item in self.categories if item["id"] == parent_id),
+            None,
+        )
+        current_category = next(
+            (
+                item
+                for item in self.categories
+                if item["id"] == self.editing_category_id
+            ),
+            None,
+        )
+        unchanged_inactive_parent = (
+            parent is not None
+            and not parent["ativo"]
+            and current_category is not None
+            and current_category["categoria_pai_id"] == parent_id
+        )
+        if parent_id is not None and (
+            parent is None or (not parent["ativo"] and not unchanged_inactive_parent)
+        ):
+            self.category_error = "O departamento selecionado não está disponível."
+            return
+
+        ancestor_id = parent_id
+        while ancestor_id is not None:
+            if ancestor_id == self.editing_category_id:
+                self.category_error = (
+                    "Uma categoria não pode ser movida para dentro de uma "
+                    "de suas subcategorias."
+                )
+                return
+            ancestor = next(
+                (item for item in self.categories if item["id"] == ancestor_id),
+                None,
+            )
+            ancestor_id = ancestor["categoria_pai_id"] if ancestor else None
+
+        payload = {
+            "nome": name,
+            "descricao": self.category_form_description.strip(),
+            "categoria_pai_id": parent_id,
+            "ativo": self.category_form_active == "Ativa",
+            "cor": color,
+        }
+        category_id = self.editing_category_id
+        method = "PATCH" if category_id else "POST"
+        endpoint = (
+            f"/categoria/{category_id}" if category_id else "/categoria"
+        )
+        self.is_saving_category = True
+        self.category_error = ""
+        self.category_notice = ""
+        try:
+            response = await xano.request(
+                method,
+                endpoint,
+                payload=payload,
+                auth_token=self._auth_token,
+                base_url=xano.XANO_PHARMACY_API_URL,
+            )
+            if response.status_code not in (200, 201):
+                self.category_error = xano.response_message(
+                    xano.response_data(response),
+                    f"Não foi possível salvar a categoria (HTTP {response.status_code}).",
+                )
+                return
+
+            self.set_category_form_open(False)
+            self.is_loading_categories = True
+            if await self._load_categories():
+                self.category_notice = "Categoria salva com sucesso."
+            else:
+                self.category_notice = (
+                    "A categoria foi salva, mas a lista não pôde ser atualizada. "
+                    "Atualize a página para confirmar os dados."
+                )
+        except httpx.RequestError:
+            logger.warning("A gravação de categoria no Xano falhou.")
+            self.category_error = "Não foi possível conectar ao Xano para salvar."
+        finally:
+            self.is_loading_categories = False
+            self.is_saving_category = False
+
+    @rx.event
+    def request_category_delete(self, category_id: int):
+        category = next(
+            (item for item in self.categories if item["id"] == category_id),
+            None,
+        )
+        if category is None:
+            logger.warning("Foi solicitada a exclusão de uma categoria não carregada.")
+            self.category_error = "A categoria selecionada não está disponível."
+            return
+        self.deleting_category_id = category_id
+        self.deleting_category_name = category["nome"]
+        self.category_error = ""
+        self.show_category_delete_confirmation = True
+
+    @rx.event
+    def set_category_delete_confirmation_open(self, is_open: bool):
+        self.show_category_delete_confirmation = is_open
+        if not is_open:
+            self.deleting_category_id = 0
+            self.deleting_category_name = ""
+
+    @rx.event
+    async def delete_category(self):
+        if not self._auth_token:
+            return rx.redirect("/")
+        if not self.deleting_category_id:
+            self.category_error = "Selecione uma categoria válida para excluir."
+            return
+
+        self.is_deleting_category = True
+        self.category_error = ""
+        self.category_notice = ""
+        try:
+            response = await xano.request(
+                "DELETE",
+                f"/categoria/{self.deleting_category_id}",
+                auth_token=self._auth_token,
+                base_url=xano.XANO_PHARMACY_API_URL,
+            )
+            if response.status_code not in (200, 204):
+                self.category_error = xano.response_message(
+                    xano.response_data(response),
+                    f"Não foi possível excluir a categoria (HTTP {response.status_code}).",
+                )
+                return
+
+            self.set_category_delete_confirmation_open(False)
+            self.is_loading_categories = True
+            if await self._load_categories():
+                self.category_notice = "Categoria excluída com sucesso."
+            else:
+                self.category_notice = (
+                    "A categoria foi excluída, mas a lista não pôde ser "
+                    "atualizada. Atualize a página para confirmar os dados."
+                )
+        except httpx.RequestError:
+            logger.warning("A exclusão de categoria no Xano falhou.")
+            self.category_error = "Não foi possível conectar ao Xano para excluir."
+        finally:
+            self.is_loading_categories = False
+            self.is_deleting_category = False
+
     async def _load_products(self) -> bool:
         response = await xano.request(
             "GET",
@@ -390,6 +979,7 @@ class LoginState(rx.State):
                     **product,
                     "imagem_url": str(product.get("imagem_url") or ""),
                     "preco_formatado": formatted_price,
+                    "categoria_id": _reference_id(product.get("categoria_id")),
                 }
             )
         return normalized_products
@@ -403,6 +993,7 @@ class LoginState(rx.State):
         self.stock_error = ""
         try:
             await self._load_products()
+            await self._load_categories()
         except httpx.RequestError:
             logger.warning("A consulta de produtos no Xano falhou.")
             self.stock_error = "Não foi possível conectar ao estoque no Xano."
@@ -412,6 +1003,57 @@ class LoginState(rx.State):
     @rx.event
     def set_product_search(self, value: str):
         self.product_search = value
+
+    @rx.event
+    def set_product_category_search(self, value: str):
+        self.product_category_search = value
+        if value in ("", "Todas as categorias"):
+            self.selected_product_category_id = ""
+            return
+
+        category = next(
+            (
+                category
+                for category in self.categories
+                if category["ativo"] and self._category_label(category) == value
+            ),
+            None,
+        )
+        if category is None:
+            logger.warning("Foi selecionada uma categoria que não está carregada.")
+            self.category_error = "A categoria selecionada não está disponível."
+            self.product_category_search = ""
+            self.selected_product_category_id = ""
+            return
+        self.selected_product_category_id = str(category["id"])
+
+    @rx.event
+    def set_product_form_category(self, value: str):
+        if value == "Sem categoria":
+            self.product_form_category_id = ""
+            return
+
+        category = next(
+            (
+                category
+                for category in self.categories
+                if category["ativo"] and self._category_label(category) == value
+            ),
+            None,
+        )
+        if category is None:
+            logger.warning("Foi submetida uma categoria de produto inválida.")
+            self.stock_error = "A categoria selecionada não está disponível."
+            return
+        self.product_form_category_id = str(category["id"])
+
+    @rx.event
+    def set_category_search(self, value: str):
+        self.category_search_query = value
+
+    @rx.event
+    def clear_category_search(self):
+        self.category_search_query = ""
 
     @rx.event
     def set_product_name(self, value: str):
@@ -451,6 +1093,7 @@ class LoginState(rx.State):
         self.show_product_form = is_open
         if not is_open:
             self.editing_product_id = 0
+            self.product_form_category_id = ""
             self.product_name = ""
             self.product_barcode = ""
             self.product_price = ""
@@ -468,8 +1111,10 @@ class LoginState(rx.State):
         price: float,
         stock: int,
         image_url: str,
+        category_id: str = "",
     ):
         self.editing_product_id = product_id
+        self.product_form_category_id = str(_reference_id(category_id) or "")
         self.product_name = name
         self.product_barcode = barcode
         self.product_price = str(price)
@@ -490,6 +1135,7 @@ class LoginState(rx.State):
     @rx.event
     def cancel_product_edit(self):
         self.editing_product_id = 0
+        self.product_form_category_id = ""
         self.product_name = ""
         self.product_barcode = ""
         self.product_price = ""
@@ -535,6 +1181,7 @@ class LoginState(rx.State):
             "codigo_barras": barcode,
             "preco": price,
             "estoque_quantidade": stock,
+            "categoria_id": _reference_id(self.product_form_category_id),
         }
         if image_url or self.original_product_image_url:
             payload["imagem_url"] = image_url
@@ -545,7 +1192,7 @@ class LoginState(rx.State):
             if self.editing_product_id
             else "/produto"
         )
-        method = "PUT" if self.editing_product_id else "POST"
+        method = "PATCH" if self.editing_product_id else "POST"
 
         self.is_saving_product = True
         self.stock_error = ""
@@ -658,6 +1305,7 @@ class LoginState(rx.State):
                 xano.response_data(customers_response),
                 "clientes",
             )
+            await self._load_categories()
         except httpx.RequestError:
             logger.warning("A carga da tela de vendas no Xano falhou.")
             self.sales_error = "Não foi possível conectar às APIs de vendas do Xano."
@@ -733,6 +1381,7 @@ class LoginState(rx.State):
         self.show_cart_panel = False
         self.customer_notice = ""
         self.sales_error = ""
+        self.sales_notice = ""
 
     @rx.event
     def set_cart_panel_open(self, value: bool):
@@ -748,6 +1397,120 @@ class LoginState(rx.State):
     @rx.event
     def set_payment_method(self, value: str):
         self.payment_method = value
+
+    @rx.event
+    async def finalize_sale(self):
+        if not self._auth_token:
+            return rx.redirect("/")
+        if self.is_finalizing_sale:
+            return
+        if not self.cart:
+            self.sales_error = "Adicione produtos ao carrinho antes de finalizar."
+            return
+
+        payment_methods = {
+            "Dinheiro": "dinheiro",
+            "PIX": "pix",
+            "Crédito": "credito",
+            "Débito": "debito",
+        }
+        payment_method = payment_methods.get(self.payment_method)
+        if payment_method is None:
+            self.sales_error = "Selecione uma forma de pagamento válida."
+            return
+
+        items = []
+        for item in self.cart:
+            try:
+                product_id = int(item["produto_id"])
+                quantity = int(item["quantidade"])
+            except (KeyError, TypeError, ValueError):
+                self.sales_error = "O carrinho contém um produto ou quantidade inválida."
+                return
+            if product_id < 1 or quantity < 1:
+                self.sales_error = "O carrinho contém um produto ou quantidade inválida."
+                return
+            items.append({"produto_id": product_id, "quantidade": quantity})
+
+        customer_id = None
+        if self._is_selected_customer_registered():
+            customer = self._selected_customer_record()
+            customer_id = _reference_id(customer.get("id")) if customer else None
+            if customer_id is None:
+                self.sales_error = (
+                    "Não foi possível confirmar o cliente selecionado. "
+                    "Atualize a lista de clientes e tente novamente."
+                )
+                return
+
+        self.is_finalizing_sale = True
+        self.sales_error = ""
+        self.sales_notice = ""
+        try:
+            response = await xano.request(
+                "POST",
+                "/venda/finalizar",
+                auth_token=self._auth_token,
+                base_url=xano.XANO_PHARMACY_API_URL,
+                payload={
+                    "itens": items,
+                    "cliente_id": customer_id,
+                    "forma_pagamento": payment_method,
+                },
+            )
+            response_data = xano.response_data(response)
+            if response.status_code not in (200, 201):
+                self.sales_error = xano.response_message(
+                    response_data,
+                    f"Não foi possível finalizar a venda (HTTP {response.status_code}).",
+                )
+                return
+
+            sale = (
+                response_data.get("venda")
+                if isinstance(response_data, dict)
+                else None
+            )
+            sale_id = sale.get("id") if isinstance(sale, dict) else None
+            if (
+                not isinstance(response_data, dict)
+                or response_data.get("success") is not True
+                or isinstance(sale_id, bool)
+                or not isinstance(sale_id, int)
+                or sale_id < 1
+            ):
+                logger.error("O Xano retornou sucesso sem confirmar uma venda válida.")
+                self.sales_error = xano.response_message(
+                    response_data,
+                    "O Xano não confirmou a venda. O carrinho foi preservado; "
+                    "atualize o histórico antes de tentar novamente.",
+                )
+                return
+
+            self.cart = []
+            self.selected_customer = ""
+            self.customer_status = "unregistered"
+            self.customer_notice = ""
+            self.show_cart_panel = False
+            await self.load_sales()
+            if self.sales_error:
+                self.sales_notice = (
+                    "Venda finalizada, mas não foi possível atualizar o catálogo "
+                    "e o histórico. Atualize a tela antes de iniciar outra venda."
+                )
+                logger.error(
+                    "A venda foi finalizada, mas a atualização do catálogo/histórico falhou."
+                )
+                return
+            self.sales_notice = "Venda finalizada e estoque atualizado com sucesso."
+        except httpx.RequestError:
+            logger.warning("A finalização de venda no Xano falhou.")
+            self.sales_error = (
+                "Não foi possível confirmar a finalização no Xano. "
+                "O carrinho foi preservado; atualize o histórico antes de tentar novamente."
+            )
+        finally:
+            self.is_finalizing_sale = False
 
     @rx.event
     def set_selected_customer(self, value: str):
@@ -904,16 +1667,24 @@ class ForgotPasswordState(rx.State):
             return
 
         try:
-            await xano.request(
+            response = await xano.request(
                 "GET",
                 "/reset/request-reset-link",
                 params={"email": email},
             )
+            if response.status_code not in (200, 201):
+                logger.warning(
+                    "A solicitacao de redefinicao no Xano retornou HTTP %s.",
+                    response.status_code,
+                )
         except httpx.RequestError:
             logger.warning("A solicitacao de link de redefinicao para o Xano falhou.")
 
         self.is_loading = False
-        return rx.redirect(f"/redefinir-senha?email={email}")
+        self.message = (
+            "Se o e-mail estiver cadastrado, enviaremos um link de recuperação. "
+            "Verifique sua caixa de entrada e a pasta de spam."
+        )
 
 
 class ResetPasswordState(rx.State):
@@ -1674,7 +2445,7 @@ def management_sidebar(active: str) -> rx.Component:
             item("Visão Geral", "house", "/dashboard", "overview"),
             item("Gestão de Estoque", "boxes", "/estoque", "stock"),
             item("Vendas", "shopping-cart", "/vendas", "sales"),
-            sidebar_item_disabled("Categorias", "tag"),
+            item("Categorias", "tag", "/categorias", "categories"),
             sidebar_item_disabled("Funcionários", "users"),
             sidebar_item_disabled("Configurações", "settings"),
             rx.spacer(),
@@ -1765,6 +2536,46 @@ def management_page_shell(
         width="100%",
         min_height="100vh",
         background="#f3f4f6",
+    )
+
+
+def product_category_search_control() -> rx.Component:
+    return rx.vstack(
+        rx.text(
+            "Filtrar por departamento ou categoria",
+            color="#34485b",
+            font_size="0.88rem",
+            font_weight="700",
+        ),
+        rx.select(
+            LoginState.product_category_options,
+            value=LoginState.product_category_search,
+            on_change=LoginState.set_product_category_search,
+            placeholder="Todas as categorias",
+            aria_label="Filtrar por departamento ou categoria",
+            width="100%",
+            background="white",
+            color="#1f2c39",
+        ),
+        rx.cond(
+            LoginState.category_error != "",
+            rx.text(
+                LoginState.category_error,
+                color="#b91c1c",
+                font_size="0.76rem",
+                role="alert",
+            ),
+            rx.text(
+                "O filtro usa a categoria associada ao produto e inclui as "
+                "subcategorias do departamento selecionado.",
+                color="#64748b",
+                font_size="0.76rem",
+                line_height="1.4",
+            ),
+        ),
+        width="100%",
+        spacing="2",
+        align_items="stretch",
     )
 
 
@@ -1887,6 +2698,7 @@ def stock_page() -> rx.Component:
                         product["preco"],
                         quantity,
                         product["imagem_url"],
+                        product["categoria_id"].to_string(),
                     ),
                     variant="outline",
                     color="#1d4ed8",
@@ -1947,6 +2759,7 @@ def stock_page() -> rx.Component:
             spacing="2",
             align_items="stretch",
         ),
+        product_category_search_control(),
         rx.hstack(
             rx.spacer(),
             rx.button(
@@ -2056,6 +2869,26 @@ def stock_page() -> rx.Component:
                     width="100%",
                     spacing="4",
                     flex_wrap="wrap",
+                ),
+                rx.vstack(
+                    rx.text(
+                        "Categoria do produto",
+                        color="#34485b",
+                        font_size="0.88rem",
+                        font_weight="700",
+                    ),
+                    rx.select(
+                        LoginState.product_form_category_options,
+                        value=LoginState.product_form_category_label,
+                        on_change=LoginState.set_product_form_category,
+                        aria_label="Categoria do produto",
+                        width="100%",
+                        background="white",
+                        color="#1f2c39",
+                    ),
+                    width="100%",
+                    spacing="2",
+                    align_items="stretch",
                 ),
                 product_input(
                     "Foto do produto (opcional)",
@@ -2192,6 +3025,554 @@ def stock_page() -> rx.Component:
         align_items="stretch",
     )
     return management_page_shell("stock", "Gestão de Estoque", content)
+
+
+def categories_page() -> rx.Component:
+    def category_form_input(
+        label: str,
+        placeholder: str,
+        value: rx.Var,
+        on_change: Any,
+    ) -> rx.Component:
+        return rx.vstack(
+            rx.text(
+                label,
+                color="#34485b",
+                font_size="0.88rem",
+                font_weight="700",
+            ),
+            rx.input(
+                placeholder=placeholder,
+                value=value,
+                on_change=on_change,
+                aria_label=label,
+                width="100%",
+                height="46px",
+                padding="0 0.8rem",
+                background="#f8fafc",
+                border="1px solid #cbd5e1",
+                border_radius="10px",
+                color="#1f2c39",
+                _focus={
+                    "border": "1px solid #16a34a",
+                    "box_shadow": "0 0 0 3px rgba(22,163,74,0.12)",
+                    "outline": "none",
+                },
+            ),
+            width="100%",
+            spacing="2",
+            align_items="stretch",
+        )
+
+    def subcategory_chip(category: rx.Var) -> rx.Component:
+        return rx.hstack(
+            rx.text(
+                category["nome"],
+                color="#475569",
+                font_size="0.82rem",
+                line_height="1.3",
+            ),
+            rx.cond(
+                category["ativo"],
+                rx.badge("Ativa", color_scheme="green", variant="soft"),
+                rx.badge("Inativa", color_scheme="gray", variant="soft"),
+            ),
+            rx.icon_button(
+                rx.icon("pencil", size=13),
+                on_click=LoginState.start_category_edit(category["id"]),
+                aria_label=rx.cond(
+                    category["ativo"],
+                    "Editar categoria " + category["nome"],
+                    "Editar categoria inativa " + category["nome"],
+                ),
+                size="1",
+                variant="ghost",
+                color="#475569",
+            ),
+            rx.icon_button(
+                rx.icon("trash-2", size=13),
+                on_click=LoginState.request_category_delete(category["id"]),
+                aria_label="Excluir categoria " + category["nome"],
+                size="1",
+                variant="ghost",
+                color="#b91c1c",
+            ),
+            width="fit-content",
+            padding="0.35rem 0.45rem 0.35rem 0.7rem",
+            background="#f8fafc",
+            border="1px solid #e2e8f0",
+            border_radius="12px",
+            align_items="center",
+            spacing="2",
+        )
+
+    def category_group_card(group: rx.Var) -> rx.Component:
+        return rx.vstack(
+            rx.hstack(
+                rx.box(
+                    rx.icon("shapes", size=22, color="#1f2937"),
+                    width="48px",
+                    height="48px",
+                    display="flex",
+                    align_items="center",
+                    justify_content="center",
+                    background=group["cor"],
+                    border_radius="15px",
+                ),
+                rx.vstack(
+                    rx.text(
+                        "DEPARTAMENTO",
+                        color="#64748b",
+                        font_size="0.68rem",
+                        font_weight="700",
+                        letter_spacing="0.08em",
+                    ),
+                    rx.heading(
+                        group["nome"],
+                        color="#1f2c39",
+                        size="4",
+                    ),
+                    rx.cond(
+                        group["ativo"],
+                        rx.badge("Ativo", color_scheme="green", variant="soft"),
+                        rx.badge("Inativo", color_scheme="gray", variant="soft"),
+                    ),
+                    align_items="flex-start",
+                    spacing="1",
+                ),
+                rx.spacer(),
+                rx.icon_button(
+                    rx.icon("pencil", size=16),
+                    on_click=LoginState.start_category_edit(group["id"]),
+                    aria_label="Editar categoria " + group["nome"],
+                    variant="outline",
+                    color="#1d4ed8",
+                ),
+                rx.icon_button(
+                    rx.icon("trash-2", size=16),
+                    on_click=LoginState.request_category_delete(group["id"]),
+                    aria_label="Excluir categoria " + group["nome"],
+                    variant="outline",
+                    color="#b91c1c",
+                ),
+                width="100%",
+                align_items="center",
+                spacing="3",
+            ),
+            rx.text(
+                group["descricao"],
+                color="#64748b",
+                font_size="0.88rem",
+                line_height="1.5",
+                width="100%",
+            ),
+            rx.hstack(
+                rx.foreach(group["subcategorias"], subcategory_chip),
+                width="100%",
+                flex_wrap="wrap",
+                align_items="center",
+                spacing="2",
+            ),
+            width="100%",
+            padding="1.2rem",
+            background="white",
+            border="1px solid #e5e7eb",
+            border_radius="16px",
+            align_items="stretch",
+            spacing="3",
+            box_shadow="0 4px 14px rgba(15,23,42,0.04)",
+            _hover={
+                "border_color": "#cbd5e1",
+                "box_shadow": "0 10px 24px rgba(15,23,42,0.07)",
+            },
+        )
+
+    content = rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.text(
+                    "Navegue por departamentos e encontre os grupos de produtos da farmácia.",
+                    color="#64748b",
+                    font_size="0.95rem",
+                    line_height="1.6",
+                ),
+                rx.text(
+                    "Uma visão organizada para facilitar a consulta do catálogo.",
+                    color="#64748b",
+                    font_size="0.88rem",
+                ),
+                align_items="flex-start",
+                spacing="1",
+            ),
+            rx.spacer(),
+            rx.vstack(
+                rx.hstack(
+                    rx.icon("layers-3", size=17, color="#15803d"),
+                    rx.text(
+                        LoginState.filtered_categories.length(),
+                        " departamentos",
+                        color="#166534",
+                        font_size="0.85rem",
+                        font_weight="700",
+                    ),
+                    rx.text("·", color="#94a3b8"),
+                    rx.text(
+                        LoginState.filtered_subcategory_count,
+                        " subcategorias",
+                        color="#166534",
+                        font_size="0.85rem",
+                        font_weight="700",
+                    ),
+                    padding="0.65rem 0.85rem",
+                    background="#f0fdf4",
+                    border="1px solid #bbf7d0",
+                    border_radius="999px",
+                    align_items="center",
+                    spacing="2",
+                ),
+                rx.button(
+                    rx.icon("plus", size=16),
+                    "Nova categoria",
+                    on_click=LoginState.start_new_category,
+                    background="#16a34a",
+                    color="white",
+                    border_radius="10px",
+                    padding="0.75rem 1rem",
+                    _hover={"background": "#15803d"},
+                ),
+                width="100%",
+                align_items=["flex-start", "flex-end"],
+                spacing="3",
+            ),
+            width="100%",
+            align_items=["flex-start", "center"],
+            flex_wrap="wrap",
+            spacing="4",
+        ),
+        rx.hstack(
+            rx.icon("search", size=18, color="#64748b"),
+            rx.input(
+                placeholder="Buscar departamento ou subcategoria",
+                value=LoginState.category_search_query,
+                on_change=LoginState.set_category_search,
+                aria_label="Buscar departamento ou subcategoria",
+                width="100%",
+                height="48px",
+                border="none",
+                outline="none",
+                background="transparent",
+                color="#1f2c39",
+                _placeholder={"color": "#64748b"},
+                _focus={"box_shadow": "none"},
+            ),
+            width="100%",
+            max_width="680px",
+            min_height="52px",
+            padding="0 0.9rem",
+            background="white",
+            border="1px solid #cbd5e1",
+            border_radius="12px",
+            spacing="3",
+            align_items="center",
+            _focus_within={
+                "border": "1px solid #16a34a",
+                "box_shadow": "0 0 0 3px rgba(22,163,74,0.12)",
+            },
+        ),
+        rx.cond(
+            LoginState.is_loading_categories,
+            rx.text(
+                "Carregando categorias do Xano...",
+                color="#64748b",
+                role="status",
+            ),
+            rx.fragment(),
+        ),
+        rx.cond(
+            LoginState.category_error != "",
+            rx.text(LoginState.category_error, color="#b91c1c", role="alert"),
+            rx.fragment(),
+        ),
+        rx.cond(
+            LoginState.category_notice != "",
+            rx.text(LoginState.category_notice, color="#15803d", role="status"),
+            rx.fragment(),
+        ),
+        rx.callout(
+            "Departamentos e subcategorias são carregados do Xano. A categoria "
+            "selecionada no cadastro de produto fica associada ao produto.",
+            icon="info",
+            color_scheme="blue",
+            width="100%",
+        ),
+        rx.dialog.root(
+            rx.dialog.content(
+                rx.hstack(
+                    rx.vstack(
+                        rx.dialog.title(
+                            rx.cond(
+                                LoginState.editing_category_id > 0,
+                                "Editar categoria",
+                                "Nova categoria",
+                            ),
+                            color="#1f2c39",
+                            font_size="1.3rem",
+                            font_weight="700",
+                        ),
+                        rx.dialog.description(
+                            "Gerencie o catálogo persistido no Xano.",
+                            color="#64748b",
+                            font_size="0.9rem",
+                        ),
+                        align_items="flex-start",
+                        spacing="1",
+                    ),
+                    rx.dialog.close(
+                        rx.button(
+                            rx.icon("x", size=18),
+                            variant="ghost",
+                            color="#64748b",
+                            aria_label="Fechar formulário de categoria",
+                        )
+                    ),
+                    width="100%",
+                    justify="between",
+                    align_items="flex-start",
+                ),
+                rx.cond(
+                    LoginState.category_error != "",
+                    rx.text(
+                        LoginState.category_error,
+                        color="#b91c1c",
+                        background="#fef2f2",
+                        padding="0.75rem 0.9rem",
+                        border="1px solid #fecaca",
+                        border_radius="10px",
+                        font_size="0.88rem",
+                        role="alert",
+                        width="100%",
+                    ),
+                    rx.fragment(),
+                ),
+                category_form_input(
+                    "Nome",
+                    "Ex.: Medicamentos",
+                    LoginState.category_form_name,
+                    LoginState.set_category_form_name,
+                ),
+                category_form_input(
+                    "Descrição",
+                    "Descrição do departamento ou subcategoria",
+                    LoginState.category_form_description,
+                    LoginState.set_category_form_description,
+                ),
+                rx.hstack(
+                    rx.vstack(
+                        rx.text(
+                            "Departamento pai",
+                            color="#34485b",
+                            font_size="0.88rem",
+                            font_weight="700",
+                        ),
+                        rx.select(
+                            LoginState.category_parent_options,
+                            value=LoginState.category_form_parent_label,
+                            on_change=LoginState.set_category_form_parent,
+                            aria_label="Departamento pai",
+                            width="100%",
+                            background="white",
+                            color="#1f2c39",
+                        ),
+                        width="100%",
+                        align_items="stretch",
+                        spacing="2",
+                    ),
+                    rx.vstack(
+                        rx.text(
+                            "Status",
+                            color="#34485b",
+                            font_size="0.88rem",
+                            font_weight="700",
+                        ),
+                        rx.select(
+                            ["Ativa", "Inativa"],
+                            value=LoginState.category_form_active,
+                            on_change=LoginState.set_category_form_active,
+                            aria_label="Status da categoria",
+                            width="100%",
+                            background="white",
+                            color="#1f2c39",
+                        ),
+                        width="100%",
+                        align_items="stretch",
+                        spacing="2",
+                    ),
+                    width="100%",
+                    flex_wrap="wrap",
+                    spacing="4",
+                ),
+                category_form_input(
+                    "Cor (hexadecimal)",
+                    "#e2e8f0",
+                    LoginState.category_form_color,
+                    LoginState.set_category_form_color,
+                ),
+                rx.hstack(
+                    rx.dialog.close(
+                        rx.button(
+                            "Cancelar",
+                            variant="outline",
+                            color="#475569",
+                            border_color="#cbd5e1",
+                            height="44px",
+                            padding="0 1.2rem",
+                        )
+                    ),
+                    rx.button(
+                        rx.cond(
+                            LoginState.is_saving_category,
+                            "Salvando...",
+                            "Salvar categoria",
+                        ),
+                        on_click=LoginState.save_category,
+                        loading=LoginState.is_saving_category,
+                        disabled=LoginState.is_saving_category,
+                        background="#16a34a",
+                        color="white",
+                        height="44px",
+                        padding="0 1.2rem",
+                        border_radius="10px",
+                    ),
+                    width="100%",
+                    justify="end",
+                    spacing="3",
+                ),
+                width="min(92vw, 560px)",
+                max_height="90vh",
+                overflow_y="auto",
+                padding="1.4rem",
+                background="white",
+                border_radius="18px",
+                spacing="4",
+            ),
+            open=LoginState.show_category_form,
+            on_open_change=LoginState.set_category_form_open,
+        ),
+        rx.dialog.root(
+            rx.dialog.content(
+                rx.dialog.title(
+                    "Excluir categoria",
+                    color="#1f2c39",
+                    font_size="1.2rem",
+                    font_weight="700",
+                ),
+                rx.dialog.description(
+                    "Tem certeza de que deseja excluir ",
+                    rx.text(
+                        LoginState.deleting_category_name,
+                        as_="span",
+                        font_weight="700",
+                    ),
+                    "? A operação pode ser recusada pelo Xano se houver produtos "
+                    "ou subcategorias vinculados.",
+                    color="#64748b",
+                    font_size="0.9rem",
+                ),
+                rx.cond(
+                    LoginState.category_error != "",
+                    rx.text(
+                        LoginState.category_error,
+                        color="#b91c1c",
+                        background="#fef2f2",
+                        padding="0.75rem 0.9rem",
+                        border="1px solid #fecaca",
+                        border_radius="10px",
+                        font_size="0.88rem",
+                        role="alert",
+                        width="100%",
+                    ),
+                    rx.fragment(),
+                ),
+                rx.hstack(
+                    rx.dialog.close(
+                        rx.button(
+                            "Cancelar",
+                            variant="outline",
+                            color="#475569",
+                            border_color="#cbd5e1",
+                        )
+                    ),
+                    rx.button(
+                        rx.cond(
+                            LoginState.is_deleting_category,
+                            "Excluindo...",
+                            "Excluir",
+                        ),
+                        on_click=LoginState.delete_category,
+                        loading=LoginState.is_deleting_category,
+                        disabled=LoginState.is_deleting_category,
+                        background="#dc2626",
+                        color="white",
+                    ),
+                    width="100%",
+                    justify="end",
+                    spacing="3",
+                ),
+                width="min(92vw, 460px)",
+                padding="1.4rem",
+                background="white",
+                border_radius="18px",
+                spacing="4",
+            ),
+            open=LoginState.show_category_delete_confirmation,
+            on_open_change=LoginState.set_category_delete_confirmation_open,
+        ),
+        rx.grid(
+            rx.foreach(LoginState.filtered_categories, category_group_card),
+            columns="repeat(auto-fit, minmax(min(100%, 360px), 1fr))",
+            gap="1rem",
+            width="100%",
+        ),
+        rx.cond(
+            (LoginState.filtered_categories.length() == 0)
+            & (LoginState.is_loading_categories == False)
+            & (LoginState.category_error == ""),
+            rx.text(
+                "Nenhuma categoria encontrada.",
+                color="#64748b",
+                padding="1rem 0",
+                role="status",
+            ),
+            rx.fragment(),
+        ),
+        rx.hstack(
+            rx.text(
+                "Classificação inspirada na organização pública de categorias da ",
+                color="#64748b",
+                font_size="0.78rem",
+            ),
+            rx.link(
+                "Drogasil",
+                href="https://www.drogasil.com.br/categorias",
+                color="#15803d",
+                font_size="0.78rem",
+                font_weight="600",
+                text_decoration="underline",
+            ),
+            rx.text(
+                "; nomes e grupos foram adaptados para este projeto.",
+                color="#64748b",
+                font_size="0.78rem",
+            ),
+            width="100%",
+            flex_wrap="wrap",
+            spacing="1",
+        ),
+        width="100%",
+        spacing="4",
+        align_items="stretch",
+    )
+    return management_page_shell("categories", "Categorias", content)
 
 
 def sales_page() -> rx.Component:
@@ -2446,6 +3827,11 @@ def sales_page() -> rx.Component:
             rx.text(LoginState.sales_error, color="#dc2626", role="alert"),
             rx.fragment(),
         ),
+        rx.cond(
+            LoginState.sales_notice != "",
+            rx.text(LoginState.sales_notice, color="#15803d", role="status"),
+            rx.fragment(),
+        ),
         rx.hstack(
             rx.vstack(
                 rx.heading("Catálogo", color="#1f2c39", size="4"),
@@ -2456,6 +3842,7 @@ def sales_page() -> rx.Component:
                     width="100%",
                     background="white",
                 ),
+                product_category_search_control(),
                 rx.grid(
                     rx.foreach(LoginState.filtered_products, catalog_row),
                     columns="repeat(auto-fill, minmax(min(100%, 210px), 1fr))",
@@ -2721,11 +4108,19 @@ def sales_page() -> rx.Component:
                             color="#111827",
                             background="white",
                         ),
-                        rx.text(
-                            "A finalização demonstrativa ainda não grava a venda nem atualiza o estoque.",
-                            color="#a16207",
-                            font_size="0.82rem",
-                            role="status",
+                        rx.cond(
+                            LoginState.sales_error != "",
+                            rx.text(
+                                LoginState.sales_error,
+                                color="#b91c1c",
+                                background="#fef2f2",
+                                padding="0.75rem",
+                                border="1px solid #fecaca",
+                                border_radius="10px",
+                                font_size="0.84rem",
+                                role="alert",
+                            ),
+                            rx.fragment(),
                         ),
                         rx.hstack(
                             rx.button(
@@ -2733,12 +4128,20 @@ def sales_page() -> rx.Component:
                                 on_click=LoginState.clear_cart,
                                 variant="outline",
                                 width="100%",
+                                disabled=LoginState.is_finalizing_sale,
                             ),
                             rx.button(
-                                "Finalização pendente",
-                                disabled=True,
+                                rx.cond(
+                                    LoginState.is_finalizing_sale,
+                                    "Finalizando...",
+                                    "Finalizar venda",
+                                ),
+                                on_click=LoginState.finalize_sale,
+                                loading=LoginState.is_finalizing_sale,
+                                disabled=LoginState.is_finalizing_sale
+                                | (LoginState.cart.length() == 0),
                                 width="100%",
-                                background="#94a3b8",
+                                background="#16a34a",
                                 color="white",
                             ),
                             width="100%",
@@ -3043,7 +4446,12 @@ def dashboard_page() -> rx.Component:
                         width="100%",
                         text_decoration="none",
                     ),
-                    sidebar_item("Categorias", "tag"),
+                    rx.link(
+                        sidebar_item("Categorias", "tag"),
+                        href="/categorias",
+                        width="100%",
+                        text_decoration="none",
+                    ),
                     sidebar_item("Funcionários", "users"),
                     sidebar_item("Configurações", "settings"),
                     rx.spacer(),
@@ -3220,6 +4628,16 @@ app.add_page(
     route="/estoque",
     title="Estoque · DROGA-NONIMO",
     on_load=LoginState.load_stock,
+)
+app.add_page(
+    categories_page,
+    route="/categorias",
+    title="Categorias · DROGA-NONIMO",
+    on_load=[
+        LoginState.require_login,
+        LoginState.load_categories,
+        LoginState.clear_category_search,
+    ],
 )
 app.add_page(
     sales_page,

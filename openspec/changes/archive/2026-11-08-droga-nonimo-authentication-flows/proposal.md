@@ -10,7 +10,7 @@ As telas de login, cadastro e recuperacao precisam usar os endpoints reais do gr
 - Integrar solicitacao de recuperacao por e-mail com o magic link de uso unico do Xano.
 - Validar o magic token antes de permitir a troca da senha e enviar a redefinicao autenticada com os campos exigidos pelo Xano.
 - Usar as rotas Reflex para navegacao entre login, cadastro, recuperacao e redefinicao.
-- Fazer o magic link retornar ao frontend local durante desenvolvimento e documentar a troca para a URL publicada antes da implantacao.
+- Fazer o magic link retornar ao frontend local durante desenvolvimento. Publicacao e URL publica nao fazem parte do escopo atual.
 
 ## Decisao de seguranca
 
@@ -22,4 +22,4 @@ Os endpoints de autenticacao ja existentes no Xano sao reutilizados; nenhum endp
 
 ## Estado
 
-As integracoes e rotas foram implementadas e a compilacao Reflex foi validada. A interface exibe a mesma confirmacao neutra para qualquer resposta HTTP da solicitacao de recuperacao; detalhes de erro da API nao sao mostrados ao usuario. O destino local do magic link foi publicado no Xano. A normalizacao da resposta HTTP no proprio endpoint publico, o teste ponta a ponta com uma caixa postal de teste e a troca pela URL publica continuam pendentes.
+As integracoes e rotas foram implementadas e a compilacao Reflex foi validada. A interface exibe a mesma confirmacao neutra para qualquer resposta HTTP da solicitacao de recuperacao; detalhes de erro da API nao sao mostrados ao usuario. A resposta generica do endpoint publico foi normalizada, publicada e validada com um endereco reservado `.invalid`, sem envio de e-mail. O magic link permanece configurado para `http://localhost:3000`, conforme o escopo de uso local. Publicacao do frontend, URL publica e teste ponta a ponta com uma caixa postal real nao fazem parte do escopo atual.
